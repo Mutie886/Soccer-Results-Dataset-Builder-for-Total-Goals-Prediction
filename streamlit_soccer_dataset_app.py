@@ -35,7 +35,8 @@ MASTER_COLUMNS = [
     "created_at",
 ]
 
-FEATURE_ORDER_COLUMNS = ["cycle_id", "week_number", "batch_match_number", "global_order"]
+FEATURE_ORDER_COLUMNS = ["global_order"]
+PRIOR_WEEK_ORDER_COLUMNS = ["cycle_id", "week_number", "global_order"]
 
 EXPECTED_HISTORY_COLUMNS = [
     "goals_for",
@@ -282,7 +283,7 @@ def compute_team_history(prior_matches: pd.DataFrame, team: str) -> pd.DataFrame
     for col in EXPECTED_HISTORY_COLUMNS:
         if col not in hist.columns:
             hist[col] = np.nan
-    hist = hist.sort_values(FEATURE_ORDER_COLUMNS).reset_index(drop=True)
+    hist = hist.sort_values(PRIOR_WEEK_ORDER_COLUMNS).reset_index(drop=True)
     return hist[EXPECTED_HISTORY_COLUMNS]
 
 
@@ -327,7 +328,7 @@ def head_to_head_features(prior_matches: pd.DataFrame, home_team: str, away_team
         ((prior_matches["home_team"] == home_team) & (prior_matches["away_team"] == away_team)) |
         ((prior_matches["home_team"] == away_team) & (prior_matches["away_team"] == home_team))
     ].copy()
-    h2h = h2h.sort_values(FEATURE_ORDER_COLUMNS).tail(3)
+    h2h = h2h.sort_values(PRIOR_WEEK_ORDER_COLUMNS).tail(3)
     if h2h.empty:
         return {
             "h2h_last3_avg_total_goals": np.nan,
@@ -363,7 +364,7 @@ def build_feature_dataset(master_df: pd.DataFrame) -> pd.DataFrame:
     df = master_df.copy()
     for col in ["cycle_id", "week_number", "batch_match_number", "global_order", "match_id", "home_goals", "away_goals", "total_goals"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
-    df = df.sort_values(FEATURE_ORDER_COLUMNS).reset_index(drop=True)
+    df = df.sort_values(["global_order"]).reset_index(drop=True)
 
     rows = []
     for _, row in df.iterrows():
@@ -446,7 +447,7 @@ def append_to_master(new_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, 
     master = pd.concat([master, accepted[MASTER_COLUMNS]], ignore_index=True)
     for c in ["match_id", "cycle_id", "week_number", "batch_match_number", "global_order"]:
         master[c] = pd.to_numeric(master[c], errors="coerce")
-    master = master.sort_values(FEATURE_ORDER_COLUMNS).reset_index(drop=True)
+    master = master.sort_values(["global_order"]).reset_index(drop=True)
     save_master(master)
 
     if not rejected_existing.empty:
