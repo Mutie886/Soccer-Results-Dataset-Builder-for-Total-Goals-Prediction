@@ -562,8 +562,23 @@ metric_cols = st.columns(5)
 master_rows = len(master_saved)
 feature_rows = len(features_saved)
 teams_seen = 0 if master_saved.empty else len(pd.unique(pd.concat([master_saved["home_team"], master_saved["away_team"]], ignore_index=True)))
-cycles_seen = 0 if master_saved.empty else int(pd.to_numeric(master_saved["cycle_id"], errors="coerce").max())
-latest_week = 0 if master_saved.empty else int(pd.to_numeric(master_saved.sort_values(["cycle_id", "week_number"])["week_number"], errors="coerce").iloc[-1])
+
+cycle_numeric = pd.Series(dtype="float64") if master_saved.empty or "cycle_id" not in master_saved.columns else pd.to_numeric(master_saved["cycle_id"], errors="coerce")
+cycle_max = cycle_numeric.max() if not cycle_numeric.empty else float("nan")
+cycles_seen = 0 if pd.isna(cycle_max) else int(cycle_max)
+
+if master_saved.empty or "week_number" not in master_saved.columns:
+    latest_week = 0
+else:
+    week_sorted = master_saved.copy()
+    if "cycle_id" in week_sorted.columns:
+        week_sorted["_cycle_num"] = pd.to_numeric(week_sorted["cycle_id"], errors="coerce")
+    else:
+        week_sorted["_cycle_num"] = 0
+    week_sorted["_week_num"] = pd.to_numeric(week_sorted["week_number"], errors="coerce")
+    week_sorted = week_sorted.sort_values(["_cycle_num", "_week_num"], na_position="last")
+    latest_week_value = week_sorted["_week_num"].iloc[-1] if not week_sorted.empty else float("nan")
+    latest_week = 0 if pd.isna(latest_week_value) else int(latest_week_value)
 metric_cols[0].metric("Master rows", master_rows)
 metric_cols[1].metric("Feature rows", feature_rows)
 metric_cols[2].metric("Teams seen", teams_seen)
