@@ -130,6 +130,10 @@ def parse_week_number_from_text(raw_text: str) -> Optional[int]:
     return int(m.group(1)) if m else None
 
 
+def parse_week_numbers_from_text(raw_text: str) -> List[int]:
+    return [int(x) for x in re.findall(r"week\s*(\d{1,2})", raw_text, flags=re.IGNORECASE)]
+
+
 def is_noise_line(line: str) -> bool:
     low = line.lower().strip()
     if not low:
@@ -145,63 +149,115 @@ def is_noise_line(line: str) -> bool:
     return False
 
 
+def week_header_value(line: str) -> Optional[int]:
+    m = re.search(r"week\s*(\d{1,2})", str(line), flags=re.IGNORECASE)
+    return int(m.group(1)) if m else None
+
+
+def split_input_into_week_sections(raw_text: str, fallback_week_number: int) -> List[Tuple[int, List[str]]]:
+    raw_lines = [re.sub(r"\s+", " ", ln).strip() for ln in raw_text.splitlines()]
+    sections: List[Tuple[int, List[str]]] = []
+    current_week: Optional[int] = None
+    current_lines: List[str] = []
+
+    for line in raw_lines:
+        if not line:
+            continue
+        detected_week = week_header_value(line)
+        if detected_week is not None and line.lower().startswith("english league"):
+            if current_lines:
+                sections.append((int(current_week if current_week is not None else fallback_week_number), current_lines))
+                current_lines = []
+            current_week = detected_week
+            continue
+        if re.fullmatch(r"\d{1,2}:\d{2}\s*(am|pm)", line.lower()):
+            continue
+        if is_noise_line(line):
+            continue
+        if current_week is None:
+            current_week = int(fallback_week_number)
+        current_lines.append(line)
+
+    if current_lines:
+        sections.append((int(current_week if current_week is not None else fallback_week_number), current_lines))
+
+    return sections
+
+
 def parse_matches(raw_text: str, week_number: int, batch_id: str) -> Tuple[pd.DataFrame, List[str]]:
     warnings: List[str] = []
-    raw_lines = [re.sub(r"\s+", " ", ln).strip() for ln in raw_text.splitlines()]
-    lines = [ln for ln in raw_lines if ln and not is_noise_line(ln)]
+    sections = split_input_into_week_sections(raw_text, int(week_number))
 
-    if not lines:
+    if not sections:
         return pd.DataFrame(), ["No usable match lines were found after cleaning."]
 
-    remainder = len(lines) % 4
-    if remainder:
-        warnings.append(f"Ignored the last {remainder} line(s) because a valid match needs 4 lines.")
-        lines = lines[: len(lines) - remainder]
-
     records = []
-    for i in range(0, len(lines), 4):
-        home_team_raw, home_goals_raw, away_goals_raw, away_team_raw = lines[i:i+4]
-        home_team = normalize_team_name(home_team_raw)
-        away_team = normalize_team_name(away_team_raw)
-        if home_team == away_team:
-            warnings.append(f"Skipped block {i//4 + 1}: home team and away team are identical.")
-            continue
-        try:
-            home_goals = int(home_goals_raw)
-            away_goals = int(away_goals_raw)
-        except ValueError:
-            warnings.append(f"Skipped block {i//4 + 1}: scores must be integers.")
-            continue
-        if home_goals < 0 or away_goals < 0:
-            warnings.append(f"Skipped block {i//4 + 1}: negative goals are not allowed.")
+    section_count = len(sections)
+    if section_count > 1:
+        warnings.append(f"Detected {section_count} week sections in this input and assigned week numbers per section.")
+
+    # Input is pasted newest-to-oldest. For chronological storage, process sections bottom-to-top.
+    chronological_sections = list(reversed(sections))
+
+    running_block_counter = 0
+    for section_index, (section_week, section_lines) in enumerate(chronological_sections, start=1):
+        remainder = len(section_lines) % 4
+        if remainder:
+            warnings.append(
+                f"Week {section_week}: ignored the last {remainder} line(s) because a valid match needs 4 lines."
+            )
+            section_lines = section_lines[: len(section_lines) - remainder]
+
+        section_records = []
+        for i in range(0, len(section_lines), 4):
+            running_block_counter += 1
+            home_team_raw, home_goals_raw, away_goals_raw, away_team_raw = section_lines[i:i+4]
+            home_team = normalize_team_name(home_team_raw)
+            away_team = normalize_team_name(away_team_raw)
+            if home_team == away_team:
+                warnings.append(
+                    f"Week {section_week}, block {running_block_counter}: home team and away team are identical."
+                )
+                continue
+            try:
+                home_goals = int(home_goals_raw)
+                away_goals = int(away_goals_raw)
+            except ValueError:
+                warnings.append(f"Week {section_week}, block {running_block_counter}: scores must be integers.")
+                continue
+            if home_goals < 0 or away_goals < 0:
+                warnings.append(f"Week {section_week}, block {running_block_counter}: negative goals are not allowed.")
+                continue
+
+            section_records.append(
+                {
+                    "batch_id": batch_id,
+                    "week_number": int(section_week),
+                    "home_team": home_team,
+                    "home_goals": home_goals,
+                    "away_goals": away_goals,
+                    "away_team": away_team,
+                    "total_goals": home_goals + away_goals,
+                    "result": result_code(home_goals, away_goals),
+                    "goal_diff": home_goals - away_goals,
+                    "created_at": pd.Timestamp.utcnow().isoformat(),
+                }
+            )
+
+        if not section_records:
             continue
 
-        records.append(
-            {
-                "batch_id": batch_id,
-                "week_number": int(week_number),
-                "home_team": home_team,
-                "home_goals": home_goals,
-                "away_goals": away_goals,
-                "away_team": away_team,
-                "total_goals": home_goals + away_goals,
-                "result": result_code(home_goals, away_goals),
-                "goal_diff": home_goals - away_goals,
-                # top pasted match is latest, so store it last -> reverse later
-                "_parsed_position_top_to_bottom": i // 4 + 1,
-                "created_at": pd.Timestamp.utcnow().isoformat(),
-            }
-        )
+        section_df = pd.DataFrame(section_records)
+
+        # Inside each week, top pasted match is latest, so store that section bottom-to-top.
+        section_df = section_df.iloc[::-1].reset_index(drop=True)
+        records.extend(section_df.to_dict("records"))
 
     df = pd.DataFrame(records)
     if df.empty:
         return df, warnings
 
-    # reverse batch order so bottom match becomes first stored, top becomes last stored
-    df = df.iloc[::-1].reset_index(drop=True)
-    df["batch_match_number"] = np.arange(1, len(df) + 1)
-
-    # remove duplicates inside batch based on fixture + score + week
+    # remove duplicates inside this pasted input based on week + fixture + score
     before = len(df)
     df["_batch_dedupe_key"] = (
         df["week_number"].astype(str) + "|" +
@@ -211,28 +267,58 @@ def parse_matches(raw_text: str, week_number: int, batch_id: str) -> Tuple[pd.Da
     df = df.drop_duplicates(subset=["_batch_dedupe_key"], keep="first").reset_index(drop=True)
     removed = before - len(df)
     if removed:
-        warnings.append(f"Removed {removed} duplicate match(es) inside this pasted batch.")
+        warnings.append(f"Removed {removed} duplicate match(es) inside this pasted input.")
 
+    df["batch_match_number"] = np.arange(1, len(df) + 1)
     return df.drop(columns=["_batch_dedupe_key"]), warnings
 
 
 def infer_next_cycle_id(master: pd.DataFrame, incoming_week: int) -> int:
     if master.empty:
         return 1
-    cycle_series = pd.to_numeric(master["cycle_id"], errors="coerce")
-    week_series = pd.to_numeric(master["week_number"], errors="coerce")
-    max_cycle = cycle_series.dropna().max()
-    if pd.isna(max_cycle):
+    cycle_series = pd.to_numeric(master["cycle_id"], errors="coerce").dropna()
+    if cycle_series.empty:
         return 1
-    current_cycle = int(max_cycle)
-    current_cycle_rows = master[cycle_series == current_cycle]
-    last_week = pd.to_numeric(current_cycle_rows["week_number"], errors="coerce").dropna().max()
-    if pd.isna(last_week):
+    current_cycle = int(cycle_series.max())
+    last_week_series = pd.to_numeric(master.sort_values("global_order")["week_number"], errors="coerce").dropna()
+    if last_week_series.empty:
         return current_cycle
-    last_week = int(last_week)
-    if last_week == 38 and incoming_week == 1:
+    last_week = int(last_week_series.iloc[-1])
+    if last_week == 38 and int(incoming_week) == 1:
         return current_cycle + 1
     return current_cycle
+
+
+def assign_cycle_ids(master: pd.DataFrame, new_df: pd.DataFrame) -> pd.DataFrame:
+    if new_df.empty:
+        return new_df.copy()
+
+    out = new_df.copy().reset_index(drop=True)
+    if master.empty:
+        current_cycle = 1
+        prev_week = None
+    else:
+        master_sorted = master.copy()
+        master_sorted["global_order"] = pd.to_numeric(master_sorted["global_order"], errors="coerce")
+        master_sorted = master_sorted.sort_values("global_order")
+        cycle_vals = pd.to_numeric(master_sorted["cycle_id"], errors="coerce").dropna()
+        week_vals = pd.to_numeric(master_sorted["week_number"], errors="coerce").dropna()
+        current_cycle = int(cycle_vals.iloc[-1]) if not cycle_vals.empty else 1
+        prev_week = int(week_vals.iloc[-1]) if not week_vals.empty else None
+
+    assigned_cycles = []
+    for _, row in out.iterrows():
+        current_week = int(row["week_number"])
+        if prev_week is not None and current_week < prev_week:
+            if prev_week == 38 and current_week == 1:
+                current_cycle += 1
+            else:
+                current_cycle += 1
+        assigned_cycles.append(current_cycle)
+        prev_week = current_week
+
+    out["cycle_id"] = assigned_cycles
+    return out
 
 
 def safe_mean(series: pd.Series) -> float:
@@ -410,11 +496,9 @@ def build_feature_dataset(master_df: pd.DataFrame) -> pd.DataFrame:
 
 def append_to_master(new_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, int, pd.DataFrame]:
     master = read_master()
-    cycle_id = infer_next_cycle_id(master, int(new_df["week_number"].iloc[0]))
-    new_df = new_df.copy()
-    new_df["cycle_id"] = cycle_id
+    new_df = assign_cycle_ids(master, new_df)
 
-    # final match key without score omission; score included so exact result duplicates are blocked
+    # final match key blocks exact duplicate results within the same cycle/week/fixture
     new_df["match_key"] = (
         new_df["cycle_id"].astype(int).astype(str) + "|" +
         new_df["week_number"].astype(int).astype(str) + "|" +
@@ -447,7 +531,7 @@ def append_to_master(new_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, 
     master = pd.concat([master, accepted[MASTER_COLUMNS]], ignore_index=True)
     for c in ["match_id", "cycle_id", "week_number", "batch_match_number", "global_order"]:
         master[c] = pd.to_numeric(master[c], errors="coerce")
-    master = master.sort_values(["global_order"]).reset_index(drop=True)
+    master = master.sort_values(FEATURE_ORDER_COLUMNS).reset_index(drop=True)
     save_master(master)
 
     if not rejected_existing.empty:
@@ -473,7 +557,7 @@ def get_notification_metrics() -> dict:
 
 # ----------------------- UI -----------------------
 st.title("⚽ Soccer Results Dataset Builder")
-st.caption("Clean raw soccer results, store them in the correct time order, and export model-ready datasets.")
+st.caption("Clean raw soccer results, detect week sections, store them in the correct time order, and export model-ready datasets.")
 
 # controls
 left, right = st.columns([4, 1])
@@ -481,7 +565,7 @@ with left:
     raw_text = st.text_area("Paste raw input", height=320, placeholder="Paste the raw match results here...")
 with right:
     detected_week = parse_week_number_from_text(raw_text) if raw_text else None
-    week_number = st.number_input("Week number", min_value=1, max_value=38, value=int(detected_week) if detected_week else 1, step=1)
+    week_number = st.number_input("Fallback week number", min_value=1, max_value=38, value=int(detected_week) if detected_week else 1, step=1)
     batch_id = st.text_input("Batch id", value="batch_manual")
     process = st.button("Process and save", type="primary", use_container_width=True)
     refresh = st.button("Refresh system / start new dataset", use_container_width=True)
