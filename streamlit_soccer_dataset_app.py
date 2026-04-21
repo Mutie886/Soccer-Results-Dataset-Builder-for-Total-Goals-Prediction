@@ -319,8 +319,21 @@ def compute_team_history(prior_matches: pd.DataFrame, team: str) -> pd.DataFrame
         away_part["venue"] = "away"
 
     hist = pd.concat([home_part, away_part], ignore_index=True)
+    required_cols = [
+        "match_id",
+        "cycle_id",
+        "week_number",
+        "total_goals",
+        "goals_for",
+        "goals_against",
+        "team_result",
+        "venue",
+    ]
     if hist.empty:
-        return hist
+        return pd.DataFrame(columns=required_cols)
+    for col in required_cols:
+        if col not in hist.columns:
+            hist[col] = np.nan
     return hist.sort_values(["cycle_id", "week_number", "match_id"]).reset_index(drop=True)
 
 
