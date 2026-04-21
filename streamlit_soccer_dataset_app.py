@@ -527,8 +527,23 @@ with col2:
         value=pd.Timestamp.utcnow().strftime("batch_%Y%m%d_%H%M%S"),
     )
     save_button = st.button("Clean, process, and save", type="primary", use_container_width=True)
+    reset_button = st.button("Refresh system / start new dataset", type="secondary", use_container_width=True)
 
 notification_messages: List[Tuple[str, str]] = []
+
+if reset_button:
+    removed_files = []
+    for path in [MASTER_PATH, FEATURES_PATH, REJECTED_PATH]:
+        try:
+            if path.exists():
+                path.unlink()
+                removed_files.append(path.name)
+        except Exception as exc:
+            notification_messages.append(("error", f"Could not remove {path.name}: {exc}"))
+    if removed_files:
+        notification_messages.append(("success", "System refreshed. Removed saved dataset files: " + ", ".join(removed_files)))
+    else:
+        notification_messages.append(("info", "System was already empty. No saved dataset files were found."))
 
 if save_button:
     sections, parse_warnings = parse_sections(raw_text, int(manual_week_number) if raw_text.strip() else None)
