@@ -66,12 +66,36 @@ def total_goal_class(total_goals: int) -> str:
 
 def parse_matches(raw_text: str, match_date: str, source_batch_id: str) -> Tuple[pd.DataFrame, List[str]]:
     """
-    Parse raw text in repeated blocks of 4 non-empty lines:
-    home_team, home_goals, away_goals, away_team
+    Parse raw text in repeated blocks of 4 cleaned lines:
+    home_team, home_goals, away_goals, away_team.
+
+    The cleaner removes noise lines such as league/week headers,
+    timestamps, batch ids, and other non-match metadata before grouping.
     """
     warnings: List[str] = []
-    lines = [re.sub(r"\s+", " ", ln).strip() for ln in raw_text.splitlines()]
-    lines = [ln for ln in lines if ln]
+
+    def is_noise_line(line: str) -> bool:
+        low = line.lower().strip()
+        if not low:
+            return True
+        # time stamps like 11:08 pm / 9:54 am
+        if re.fullmatch(r"\d{1,2}:\d{2}\s*(am|pm)", low):
+            return True
+        # batch / competition headers like English League WEEK 4 - #2026042118
+        if "week" in low and "#" in low:
+            return True
+        if low.startswith("english league"):
+            return True
+        if low.startswith("league "):
+            return True
+        return False
+
+    raw_lines = [re.sub(r"\s+", " ", ln).strip() for ln in raw_text.splitlines()]
+    removed_noise = [ln for ln in raw_lines if ln and is_noise_line(ln)]
+    lines = [ln for ln in raw_lines if ln and not is_noise_line(ln)]
+
+    if removed_noise:
+        warnings.append(f"Removed {len(removed_noise)} non-match noise line(s) such as headers or timestamps before parsing.")
 
     if not lines:
         return pd.DataFrame(), ["No usable lines were found after cleaning."]
@@ -79,7 +103,7 @@ def parse_matches(raw_text: str, match_date: str, source_batch_id: str) -> Tuple
     remainder = len(lines) % 4
     if remainder != 0:
         warnings.append(
-            f"The cleaned input has {len(lines)} non-empty lines, which is not divisible by 4. "
+            f"The cleaned input has {len(lines)} usable lines, which is not divisible by 4. "
             f"The last {remainder} line(s) will be ignored."
         )
         lines = lines[: len(lines) - remainder]
