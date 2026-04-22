@@ -194,6 +194,7 @@ def reset_system() -> None:
         "last_predict_hash",
     ]:
         st.session_state.pop(key, None)
+    save_state({})
 
 
 # =========================
@@ -916,7 +917,6 @@ def build_lr_classifier() -> Pipeline:
     )
     model = LogisticRegression(
         max_iter=1400,
-        multi_class="multinomial",
         class_weight="balanced",
         solver="lbfgs",
     )
@@ -1311,8 +1311,10 @@ if process_results:
         st.error("Paste some recent results first.")
     else:
         current_hash = stable_hash(results_raw_text, str(fallback_week_number), batch_id or "batch_manual")
-        if st.session_state.get("last_results_hash") == current_hash:
-            last = st.session_state.get("last_results_result", {})
+        persisted_state = load_state()
+        processed_hashes = set(persisted_state.get("processed_results_hashes", []))
+        if st.session_state.get("last_results_hash") == current_hash or current_hash in processed_hashes:
+            last = st.session_state.get("last_results_result", persisted_state.get("last_results_result", {}))
             st.warning("This exact results batch was already processed. No records were added again.")
             if last:
                 st.info(f"Last result: accepted {last.get('accepted', 0)}, existing duplicates {last.get('existing_duplicates', 0)}, warnings {last.get('warnings', 0)}.")
@@ -1337,6 +1339,11 @@ if process_results:
                     "existing_duplicates": int(len(rejected_existing)),
                     "warnings": int(len(parse_warnings) + len(train_warnings)),
                 }
+                persisted_state = load_state()
+                processed_hashes = list(dict.fromkeys(list(persisted_state.get("processed_results_hashes", [])) + [current_hash]))
+                persisted_state["processed_results_hashes"] = processed_hashes[-500:]
+                persisted_state["last_results_result"] = st.session_state["last_results_result"]
+                save_state(persisted_state)
                 if accepted_count > 0:
                     st.success(f"Saved {accepted_count} new match(es), rebuilt datasets, and refreshed training.")
                 else:
