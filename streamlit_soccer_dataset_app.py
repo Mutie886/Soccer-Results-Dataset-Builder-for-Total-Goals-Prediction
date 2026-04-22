@@ -25,6 +25,12 @@ MASTER_COLUMNS = [
 for side in ["home_team", "away_team"]:
     for g in TOTAL_GOAL_VALUES:
         MASTER_COLUMNS.append(f"{side}_tg_{g}_counter")
+    MASTER_COLUMNS.extend([
+        f"{side}_max_tg_counter",
+        f"{side}_max_tg_bucket",
+        f"{side}_most_frequent_tg_bucket",
+        f"{side}_most_frequent_tg_count",
+    ])
 
 st.markdown(
     """
@@ -123,7 +129,7 @@ def read_master() -> pd.DataFrame:
         numeric_cols = [
             "match_id", "cycle_id", "week_number", "batch_match_number", "global_order",
             "home_goals", "away_goals", "total_goals", "total_goals_bucket", "goal_diff",
-        ] + [c for c in MASTER_COLUMNS if c.endswith("_counter")]
+        ] + [c for c in MASTER_COLUMNS if c.endswith("_counter") or c.endswith("_count") or c.endswith("_bucket")]
         for col in numeric_cols:
             df[col] = pd.to_numeric(df[col], errors="coerce")
         return df
@@ -270,39 +276,66 @@ def apply_total_goal_cycle_counters(master_df: pd.DataFrame) -> pd.DataFrame:
         out = master_df.copy()
         for side in ["home_team", "away_team"]:
             for g in TOTAL_GOAL_VALUES:
-                col = f"{side}_tg_{g}_counter"
-                if col not in out.columns:
-                    out[col] = np.nan
+                out[f"{side}_tg_{g}_counter"] = np.nan
+            out[f"{side}_max_tg_counter"] = np.nan
+            out[f"{side}_max_tg_bucket"] = np.nan
+            out[f"{side}_most_frequent_tg_bucket"] = np.nan
+            out[f"{side}_most_frequent_tg_count"] = np.nan
         return out
 
     df = master_df.copy().sort_values("global_order").reset_index(drop=True)
     for side in ["home_team", "away_team"]:
         for g in TOTAL_GOAL_VALUES:
             df[f"{side}_tg_{g}_counter"] = np.nan
+        df[f"{side}_max_tg_counter"] = np.nan
+        df[f"{side}_max_tg_bucket"] = np.nan
+        df[f"{side}_most_frequent_tg_bucket"] = np.nan
+        df[f"{side}_most_frequent_tg_count"] = np.nan
 
     current_cycle = None
     team_counters: Dict[str, Dict[int, int]] = {}
+    team_bucket_counts: Dict[str, Dict[int, int]] = {}
+    team_max_seen: Dict[str, Dict[int, int]] = {}
 
     def ensure_team(team: str):
         if team not in team_counters:
             team_counters[team] = {g: 0 for g in TOTAL_GOAL_VALUES}
+            team_bucket_counts[team] = {g: 0 for g in TOTAL_GOAL_VALUES}
+            team_max_seen[team] = {g: 0 for g in TOTAL_GOAL_VALUES}
 
     for idx, row in df.iterrows():
         row_cycle = int(row["cycle_id"])
         if current_cycle is None or row_cycle != current_cycle:
             current_cycle = row_cycle
             team_counters = {}
+            team_bucket_counts = {}
+            team_max_seen = {}
 
         bucket = int(row["total_goals_bucket"])
         for side, team_col in [("home_team", "home_team"), ("away_team", "away_team")]:
             team = row[team_col]
             ensure_team(team)
+            team_bucket_counts[team][bucket] += 1
             for g in TOTAL_GOAL_VALUES:
                 if g == bucket:
                     team_counters[team][g] = 1
                 else:
                     team_counters[team][g] += 1
+                team_max_seen[team][g] = max(team_max_seen[team][g], team_counters[team][g])
                 df.at[idx, f"{side}_tg_{g}_counter"] = team_counters[team][g]
+
+            max_bucket = min(
+                TOTAL_GOAL_VALUES,
+                key=lambda g: (-team_max_seen[team][g], g)
+            )
+            most_freq_bucket = min(
+                TOTAL_GOAL_VALUES,
+                key=lambda g: (-team_bucket_counts[team][g], g)
+            )
+            df.at[idx, f"{side}_max_tg_counter"] = team_max_seen[team][max_bucket]
+            df.at[idx, f"{side}_max_tg_bucket"] = max_bucket
+            df.at[idx, f"{side}_most_frequent_tg_bucket"] = most_freq_bucket
+            df.at[idx, f"{side}_most_frequent_tg_count"] = team_bucket_counts[team][most_freq_bucket]
     return df
 
 
@@ -345,8 +378,10 @@ def append_to_master(new_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, 
 
 
 def build_team_counter_dashboard(master_df: pd.DataFrame) -> pd.DataFrame:
+    cols = ["team"] + [f"tg_{g}_counter" for g in TOTAL_GOAL_VALUES] + [
+        "max_tg_counter", "max_tg_bucket", "most_frequent_tg_bucket", "most_frequent_tg_count"
+    ]
     if master_df.empty:
-        cols = ["team"] + [f"tg_{g}_counter" for g in TOTAL_GOAL_VALUES]
         return pd.DataFrame(columns=cols)
 
     df = master_df.sort_values("global_order")
@@ -357,15 +392,23 @@ def build_team_counter_dashboard(master_df: pd.DataFrame) -> pd.DataFrame:
         team_away = df[df["away_team"] == team].tail(1)
         latest_home_go = team_home["global_order"].iloc[0] if not team_home.empty else -1
         latest_away_go = team_away["global_order"].iloc[0] if not team_away.empty else -1
-        latest_row = team_home.iloc[0] if latest_home_go > latest_away_go else (team_away.iloc[0] if not team_away.empty else None)
-        if latest_row is None:
+        if latest_home_go == -1 and latest_away_go == -1:
             continue
-        side = "home_team" if latest_home_go > latest_away_go else "away_team"
+        if latest_home_go > latest_away_go:
+            latest_row = team_home.iloc[0]
+            side = "home_team"
+        else:
+            latest_row = team_away.iloc[0]
+            side = "away_team"
         row = {"team": team}
         for g in TOTAL_GOAL_VALUES:
             row[f"tg_{g}_counter"] = int(latest_row[f"{side}_tg_{g}_counter"])
+        row["max_tg_counter"] = int(latest_row[f"{side}_max_tg_counter"])
+        row["max_tg_bucket"] = int(latest_row[f"{side}_max_tg_bucket"])
+        row["most_frequent_tg_bucket"] = int(latest_row[f"{side}_most_frequent_tg_bucket"])
+        row["most_frequent_tg_count"] = int(latest_row[f"{side}_most_frequent_tg_count"])
         rows.append(row)
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows, columns=cols)
 
 
 def get_notification_metrics() -> dict:
@@ -390,7 +433,7 @@ st.caption("Input recent results, create the output dataset, and track each team
 
 left, right = st.columns([4, 1], gap="large")
 with left:
-    st.markdown('<div class="main-card"><div class="section-title">Recent matches input</div><div class="small-help">Paste recent results here. The system cleans the text, stores matches in chronological order, and enriches the saved dataset with team total-goal cycle counters.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="main-card"><div class="section-title">Recent matches input</div><div class="small-help">Paste recent results here. The system cleans the text, stores matches in chronological order, and enriches the saved dataset with team total-goal cycle counters and summary features.</div>', unsafe_allow_html=True)
     raw_text = st.text_area("Recent results input", height=320, placeholder="Paste the recent results here...", label_visibility="collapsed")
     st.markdown('</div>', unsafe_allow_html=True)
 
@@ -457,17 +500,38 @@ if process_results:
 master_df = read_master()
 team_dashboard_df = build_team_counter_dashboard(master_df)
 
-st.markdown('<div class="main-card"><div class="section-title">Team total-goal cycle dashboard</div><div class="caption-small">For each team, each column shows the latest running counter since the team last hit that total-goals bucket. A hit resets that bucket to 1; every miss increments it.</div></div>', unsafe_allow_html=True)
+st.markdown('<div class="main-card"><div class="section-title">Team total-goal cycle dashboard</div><div class="caption-small">For each team, each TG column shows the latest running counter since the team last hit that total-goals bucket. A hit resets that bucket to 1; every miss increments it.</div></div>', unsafe_allow_html=True)
 if team_dashboard_df.empty:
     st.info("No team counters yet. Process results to build the dashboard.")
 else:
-    display_df = team_dashboard_df.rename(columns={f"tg_{g}_counter": f"TG {g}" for g in TOTAL_GOAL_VALUES})
+    display_df = team_dashboard_df.rename(columns={
+        **{f"tg_{g}_counter": f"TG {g}" for g in TOTAL_GOAL_VALUES},
+        "max_tg_counter": "Max run reached",
+        "max_tg_bucket": "Max run TG",
+        "most_frequent_tg_bucket": "Most frequent TG",
+        "most_frequent_tg_count": "Most frequent TG count",
+    })
     st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+st.markdown('<div class="main-card"><div class="section-title">Highest-run and repetition summary</div><div class="caption-small">This summary shows, for each team, the highest TG-counter run it has ever reached in the current cycle, and the minimum TG bucket that has been repeated most often.</div></div>', unsafe_allow_html=True)
+if team_dashboard_df.empty:
+    st.info("No summary available yet.")
+else:
+    summary_df = team_dashboard_df[[
+        "team", "max_tg_counter", "max_tg_bucket", "most_frequent_tg_bucket", "most_frequent_tg_count"
+    ]].copy()
+    summary_df = summary_df.rename(columns={
+        "max_tg_counter": "Highest maximum run",
+        "max_tg_bucket": "TG with highest maximum run",
+        "most_frequent_tg_bucket": "Minimum most-frequent repeating TG",
+        "most_frequent_tg_count": "Repeat frequency",
+    }).sort_values(["Highest maximum run", "Repeat frequency", "team"], ascending=[False, False, True])
+    st.dataframe(summary_df, use_container_width=True, hide_index=True)
 
 master_download = MASTER_PATH.read_bytes() if MASTER_PATH.exists() else b""
 reqs_bytes = b"streamlit\npandas\nnumpy\n"
 
-st.markdown('<div class="main-card"><div class="section-title">Downloads</div><div class="caption-small">The saved dataset includes the new per-team total-goal cycle counter features.</div></div>', unsafe_allow_html=True)
+st.markdown('<div class="main-card"><div class="section-title">Downloads</div><div class="caption-small">The saved dataset now includes TG counters and summary features directly in matches_master.csv.</div></div>', unsafe_allow_html=True)
 d1, d2 = st.columns(2)
 with d1:
     st.download_button("Download matches_master.csv", data=master_download, file_name="matches_master.csv", mime="text/csv", use_container_width=True, disabled=not bool(master_download))
