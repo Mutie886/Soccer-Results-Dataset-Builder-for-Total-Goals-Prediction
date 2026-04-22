@@ -1,3 +1,4 @@
+
 import hashlib
 import json
 import re
@@ -36,25 +37,8 @@ MASTER_COLUMNS = [
     "created_at",
 ]
 
-STANDINGS_COLUMNS = [
-    "snapshot_id",
-    "cycle_id",
-    "week_number",
-    "team",
-    "rank",
-    "points",
-    "form_raw",
-    "form_wins_last5",
-    "form_draws_last5",
-    "form_losses_last5",
-    "form_points_last5",
-    "standings_key",
-    "created_at",
-]
-
 FEATURE_ORDER_COLUMNS = ["global_order"]
 PRIOR_WEEK_ORDER_COLUMNS = ["cycle_id", "week_number", "global_order"]
-STANDINGS_ORDER_COLUMNS = ["cycle_id", "week_number", "snapshot_id"]
 
 EXPECTED_HISTORY_COLUMNS = [
     "goals_for",
@@ -69,7 +53,28 @@ EXPECTED_HISTORY_COLUMNS = [
     "match_id",
 ]
 
+STANDINGS_COLUMNS = [
+    "cycle_id",
+    "week_number",
+    "team",
+    "rank",
+    "played",
+    "wins",
+    "draws",
+    "losses",
+    "goals_for",
+    "goals_against",
+    "goal_diff",
+    "points",
+    "form_last5",
+    "form_points_last5",
+    "form_wins_last5",
+    "form_draws_last5",
+    "form_losses_last5",
+]
 
+
+# ----------------------- helpers -----------------------
 def normalize_team_name(name: str) -> str:
     return re.sub(r"\s+", " ", str(name).strip()).title()
 
@@ -86,8 +91,8 @@ def total_goal_class(total_goals: int) -> str:
     return str(total_goals) if total_goals <= 6 else "6_plus"
 
 
-def stable_batch_hash(raw_text: str, week_number: int, batch_id: str, standings_text: str = "", standings_week: int = 1) -> str:
-    payload = f"{week_number}|{batch_id}|{standings_week}|{raw_text.strip()}|{standings_text.strip()}"
+def stable_batch_hash(raw_text: str, week_number: int, batch_id: str) -> str:
+    payload = f"{week_number}|{batch_id}|{raw_text.strip()}"
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
@@ -120,7 +125,10 @@ def read_master() -> pd.DataFrame:
             if col not in df.columns:
                 df[col] = np.nan
         df = df[MASTER_COLUMNS]
-        for col in ["match_id", "cycle_id", "week_number", "batch_match_number", "global_order", "home_goals", "away_goals", "total_goals", "goal_diff"]:
+        for col in [
+            "match_id", "cycle_id", "week_number", "batch_match_number", "global_order",
+            "home_goals", "away_goals", "total_goals", "goal_diff"
+        ]:
             df[col] = pd.to_numeric(df[col], errors="coerce")
         return df
     return pd.DataFrame(columns=MASTER_COLUMNS)
@@ -130,25 +138,12 @@ def save_master(df: pd.DataFrame) -> None:
     df.to_csv(MASTER_PATH, index=False)
 
 
-def read_standings() -> pd.DataFrame:
-    if STANDINGS_PATH.exists():
-        df = pd.read_csv(STANDINGS_PATH)
-        for col in STANDINGS_COLUMNS:
-            if col not in df.columns:
-                df[col] = np.nan
-        df = df[STANDINGS_COLUMNS]
-        for col in ["snapshot_id", "cycle_id", "week_number", "rank", "points", "form_wins_last5", "form_draws_last5", "form_losses_last5", "form_points_last5"]:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-        return df
-    return pd.DataFrame(columns=STANDINGS_COLUMNS)
+def save_features(df: pd.DataFrame) -> None:
+    df.to_csv(FEATURES_PATH, index=False)
 
 
 def save_standings(df: pd.DataFrame) -> None:
     df.to_csv(STANDINGS_PATH, index=False)
-
-
-def save_features(df: pd.DataFrame) -> None:
-    df.to_csv(FEATURES_PATH, index=False)
 
 
 def append_rejected(df: pd.DataFrame) -> None:
@@ -209,12 +204,14 @@ def split_input_into_week_sections(raw_text: str, fallback_week_number: int) -> 
 
     if current_lines:
         sections.append((int(current_week if current_week is not None else fallback_week_number), current_lines))
+
     return sections
 
 
 def parse_matches(raw_text: str, week_number: int, batch_id: str) -> Tuple[pd.DataFrame, List[str]]:
     warnings: List[str] = []
     sections = split_input_into_week_sections(raw_text, int(week_number))
+
     if not sections:
         return pd.DataFrame(), ["No usable match lines were found after cleaning."]
 
@@ -222,12 +219,15 @@ def parse_matches(raw_text: str, week_number: int, batch_id: str) -> Tuple[pd.Da
     if len(sections) > 1:
         warnings.append(f"Detected {len(sections)} week sections in this input and assigned week numbers per section.")
 
-    chronological_sections = list(reversed(sections))
+    chronological_sections = list(reversed(sections))  # input is pasted newest-to-oldest
+
     running_block_counter = 0
     for section_week, section_lines in chronological_sections:
         remainder = len(section_lines) % 4
         if remainder:
-            warnings.append(f"Week {section_week}: ignored the last {remainder} line(s) because a valid match needs 4 lines.")
+            warnings.append(
+                f"Week {section_week}: ignored the last {remainder} line(s) because a valid match needs 4 lines."
+            )
             section_lines = section_lines[: len(section_lines) - remainder]
 
         section_records = []
@@ -236,35 +236,43 @@ def parse_matches(raw_text: str, week_number: int, batch_id: str) -> Tuple[pd.Da
             home_team_raw, home_goals_raw, away_goals_raw, away_team_raw = section_lines[i:i+4]
             home_team = normalize_team_name(home_team_raw)
             away_team = normalize_team_name(away_team_raw)
+
             if home_team == away_team:
                 warnings.append(f"Week {section_week}, block {running_block_counter}: home team and away team are identical.")
                 continue
+
             try:
                 home_goals = int(home_goals_raw)
                 away_goals = int(away_goals_raw)
             except ValueError:
                 warnings.append(f"Week {section_week}, block {running_block_counter}: scores must be integers.")
                 continue
+
             if home_goals < 0 or away_goals < 0:
                 warnings.append(f"Week {section_week}, block {running_block_counter}: negative goals are not allowed.")
                 continue
-            section_records.append({
-                "batch_id": batch_id,
-                "week_number": int(section_week),
-                "home_team": home_team,
-                "home_goals": home_goals,
-                "away_goals": away_goals,
-                "away_team": away_team,
-                "total_goals": home_goals + away_goals,
-                "result": result_code(home_goals, away_goals),
-                "goal_diff": home_goals - away_goals,
-                "created_at": pd.Timestamp.utcnow().isoformat(),
-            })
 
-        if section_records:
-            section_df = pd.DataFrame(section_records)
-            section_df = section_df.iloc[::-1].reset_index(drop=True)
-            records.extend(section_df.to_dict("records"))
+            section_records.append(
+                {
+                    "batch_id": batch_id,
+                    "week_number": int(section_week),
+                    "home_team": home_team,
+                    "home_goals": home_goals,
+                    "away_goals": away_goals,
+                    "away_team": away_team,
+                    "total_goals": home_goals + away_goals,
+                    "result": result_code(home_goals, away_goals),
+                    "goal_diff": home_goals - away_goals,
+                    "created_at": pd.Timestamp.utcnow().isoformat(),
+                }
+            )
+
+        if not section_records:
+            continue
+
+        section_df = pd.DataFrame(section_records)
+        section_df = section_df.iloc[::-1].reset_index(drop=True)  # top pasted match is latest -> store it last
+        records.extend(section_df.to_dict("records"))
 
     df = pd.DataFrame(records)
     if df.empty:
@@ -285,83 +293,10 @@ def parse_matches(raw_text: str, week_number: int, batch_id: str) -> Tuple[pd.Da
     return df.drop(columns=["_batch_dedupe_key"]), warnings
 
 
-def parse_form_tokens(text: str) -> List[str]:
-    compact = re.sub(r"[^WDL]", "", str(text).upper())
-    return list(compact[:5])
-
-
-def parse_standings_text(raw_text: str, week_number: int) -> Tuple[pd.DataFrame, List[str]]:
-    warnings: List[str] = []
-    lines = [re.sub(r"\s+", " ", ln).strip() for ln in raw_text.splitlines() if re.sub(r"\s+", " ", ln).strip()]
-    if not lines:
-        return pd.DataFrame(), []
-
-    records = []
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        low = line.lower()
-        if low.startswith("english league") or low in {"p team pts form", "team pts form", "p team pts"} or low == "standings":
-            i += 1
-            continue
-        if re.fullmatch(r"\d+", line):
-            rank = int(line)
-            if i + 2 >= len(lines):
-                warnings.append(f"Stopped near rank {rank}: incomplete standings row.")
-                break
-            team = normalize_team_name(lines[i + 1])
-            try:
-                points = int(lines[i + 2])
-            except ValueError:
-                warnings.append(f"Skipped standings row at rank {rank}: points must be an integer.")
-                i += 1
-                continue
-            form_parts = []
-            j = i + 3
-            while j < len(lines):
-                nxt = lines[j]
-                if re.fullmatch(r"\d+", nxt):
-                    break
-                if nxt.lower().startswith("english league"):
-                    break
-                form_parts.append(nxt)
-                j += 1
-                if len(parse_form_tokens("".join(form_parts))) >= 5:
-                    break
-            form_tokens = parse_form_tokens("".join(form_parts))
-            if not form_tokens:
-                warnings.append(f"Rank {rank}, {team}: no form tokens detected; stored empty form.")
-            records.append({
-                "week_number": int(week_number),
-                "team": team,
-                "rank": rank,
-                "points": points,
-                "form_raw": "".join(form_tokens),
-                "form_wins_last5": sum(t == "W" for t in form_tokens),
-                "form_draws_last5": sum(t == "D" for t in form_tokens),
-                "form_losses_last5": sum(t == "L" for t in form_tokens),
-                "form_points_last5": sum(3 if t == "W" else 1 if t == "D" else 0 for t in form_tokens),
-                "created_at": pd.Timestamp.utcnow().isoformat(),
-            })
-            i = j
-        else:
-            i += 1
-
-    df = pd.DataFrame(records)
-    if df.empty:
-        return df, ["No valid standings rows were detected after cleaning."]
-
-    before = len(df)
-    df = df.drop_duplicates(subset=["week_number", "team"], keep="first").reset_index(drop=True)
-    removed = before - len(df)
-    if removed:
-        warnings.append(f"Removed {removed} duplicate standings row(s) inside this pasted input.")
-    return df, warnings
-
-
 def assign_cycle_ids(master: pd.DataFrame, new_df: pd.DataFrame) -> pd.DataFrame:
     if new_df.empty:
         return new_df.copy()
+
     out = new_df.copy().reset_index(drop=True)
     if master.empty:
         current_cycle = 1
@@ -382,34 +317,8 @@ def assign_cycle_ids(master: pd.DataFrame, new_df: pd.DataFrame) -> pd.DataFrame
             current_cycle += 1
         assigned_cycles.append(current_cycle)
         prev_week = current_week
+
     out["cycle_id"] = assigned_cycles
-    return out
-
-
-def assign_cycle_ids_for_standings(standings_saved: pd.DataFrame, standings_df: pd.DataFrame) -> pd.DataFrame:
-    if standings_df.empty:
-        return standings_df.copy()
-    out = standings_df.copy().reset_index(drop=True)
-    if standings_saved.empty:
-        current_cycle = 1
-        prev_week = None
-    else:
-        temp = standings_saved.copy()
-        temp["snapshot_id"] = pd.to_numeric(temp["snapshot_id"], errors="coerce")
-        temp = temp.sort_values("snapshot_id")
-        cycles = pd.to_numeric(temp["cycle_id"], errors="coerce").dropna()
-        weeks = pd.to_numeric(temp["week_number"], errors="coerce").dropna()
-        current_cycle = int(cycles.iloc[-1]) if not cycles.empty else 1
-        prev_week = int(weeks.iloc[-1]) if not weeks.empty else None
-
-    assigned = []
-    for _, row in out.iterrows():
-        current_week = int(row["week_number"])
-        if prev_week is not None and current_week < prev_week:
-            current_cycle += 1
-        assigned.append(current_cycle)
-        prev_week = current_week
-    out["cycle_id"] = assigned
     return out
 
 
@@ -432,21 +341,31 @@ def empty_history_df() -> pd.DataFrame:
 def compute_team_history(prior_matches: pd.DataFrame, team: str) -> pd.DataFrame:
     if prior_matches.empty:
         return empty_history_df()
+
     home_part = prior_matches[prior_matches["home_team"] == team].copy()
     if not home_part.empty:
         home_part["goals_for"] = home_part["home_goals"]
         home_part["goals_against"] = home_part["away_goals"]
-        home_part["team_result"] = np.where(home_part["home_goals"] > home_part["away_goals"], "W", np.where(home_part["home_goals"] < home_part["away_goals"], "L", "D"))
+        home_part["team_result"] = np.where(
+            home_part["home_goals"] > home_part["away_goals"], "W",
+            np.where(home_part["home_goals"] < home_part["away_goals"], "L", "D")
+        )
         home_part["venue"] = "home"
+
     away_part = prior_matches[prior_matches["away_team"] == team].copy()
     if not away_part.empty:
         away_part["goals_for"] = away_part["away_goals"]
         away_part["goals_against"] = away_part["home_goals"]
-        away_part["team_result"] = np.where(away_part["away_goals"] > away_part["home_goals"], "W", np.where(away_part["away_goals"] < away_part["home_goals"], "L", "D"))
+        away_part["team_result"] = np.where(
+            away_part["away_goals"] > away_part["home_goals"], "W",
+            np.where(away_part["away_goals"] < away_part["home_goals"], "L", "D")
+        )
         away_part["venue"] = "away"
+
     hist = pd.concat([home_part, away_part], ignore_index=True)
     if hist.empty:
         return empty_history_df()
+
     for col in EXPECTED_HISTORY_COLUMNS:
         if col not in hist.columns:
             hist[col] = np.nan
@@ -456,6 +375,7 @@ def compute_team_history(prior_matches: pd.DataFrame, team: str) -> pd.DataFrame
 
 def summary_features_from_history(history: pd.DataFrame, prefix: str) -> dict:
     feats = {}
+
     def add_window(name: str, h: pd.DataFrame) -> None:
         feats[f"{prefix}_{name}_avg_scored"] = safe_mean(h["goals_for"])
         feats[f"{prefix}_{name}_avg_conceded"] = safe_mean(h["goals_against"])
@@ -466,9 +386,11 @@ def summary_features_from_history(history: pd.DataFrame, prefix: str) -> dict:
         feats[f"{prefix}_{name}_over_1_5_rate"] = over_rate(h["total_goals"], 1.5)
         feats[f"{prefix}_{name}_over_2_5_rate"] = over_rate(h["total_goals"], 2.5)
         feats[f"{prefix}_{name}_over_3_5_rate"] = over_rate(h["total_goals"], 3.5)
+
     add_window("last3", history.tail(3))
     add_window("last5", history.tail(5))
     add_window("last10", history.tail(10))
+
     home_only = history[history["venue"] == "home"].tail(5)
     away_only = history[history["venue"] == "away"].tail(5)
     feats[f"{prefix}_home_last5_avg_scored"] = safe_mean(home_only["goals_for"])
@@ -488,11 +410,13 @@ def head_to_head_features(prior_matches: pd.DataFrame, home_team: str, away_team
             "h2h_away_team_win_rate": np.nan,
             "h2h_matches_played": 0,
         }
+
     h2h = prior_matches[
         ((prior_matches["home_team"] == home_team) & (prior_matches["away_team"] == away_team)) |
         ((prior_matches["home_team"] == away_team) & (prior_matches["away_team"] == home_team))
     ].copy()
     h2h = h2h.sort_values(PRIOR_WEEK_ORDER_COLUMNS).tail(3)
+
     if h2h.empty:
         return {
             "h2h_last3_avg_total_goals": np.nan,
@@ -501,6 +425,7 @@ def head_to_head_features(prior_matches: pd.DataFrame, home_team: str, away_team
             "h2h_away_team_win_rate": np.nan,
             "h2h_matches_played": 0,
         }
+
     outcomes = []
     for _, row in h2h.iterrows():
         if row["home_goals"] == row["away_goals"]:
@@ -509,6 +434,7 @@ def head_to_head_features(prior_matches: pd.DataFrame, home_team: str, away_team
             outcomes.append("H" if row["home_goals"] > row["away_goals"] else "A")
         else:
             outcomes.append("H" if row["away_goals"] > row["home_goals"] else "A")
+
     out = pd.Series(outcomes)
     return {
         "h2h_last3_avg_total_goals": safe_mean(h2h["total_goals"]),
@@ -519,53 +445,190 @@ def head_to_head_features(prior_matches: pd.DataFrame, home_team: str, away_team
     }
 
 
-def standings_snapshot_features(standings_df: pd.DataFrame, cycle_id: int, week_number: int, team: str, prefix: str) -> dict:
-    base = {
-        f"{prefix}_rank": np.nan,
-        f"{prefix}_points": np.nan,
-        f"{prefix}_form_wins_last5": np.nan,
-        f"{prefix}_form_draws_last5": np.nan,
-        f"{prefix}_form_losses_last5": np.nan,
-        f"{prefix}_form_points_last5": np.nan,
-        f"{prefix}_standings_available": 0,
-    }
+def compute_standings_history(master_df: pd.DataFrame) -> pd.DataFrame:
+    if master_df.empty:
+        return pd.DataFrame(columns=STANDINGS_COLUMNS)
+
+    df = master_df.copy()
+    for col in ["cycle_id", "week_number", "global_order", "home_goals", "away_goals"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.sort_values(["global_order"]).reset_index(drop=True)
+
+    standings_rows = []
+    stats_by_cycle = {}
+    ordered_weeks = df[["cycle_id", "week_number"]].drop_duplicates().sort_values(["cycle_id", "week_number"])
+
+    for _, wk in ordered_weeks.iterrows():
+        cycle_id = int(wk["cycle_id"])
+        week_number = int(wk["week_number"])
+
+        if cycle_id not in stats_by_cycle:
+            stats_by_cycle[cycle_id] = {}
+
+        cycle_stats = stats_by_cycle[cycle_id]
+        week_matches = df[(df["cycle_id"] == cycle_id) & (df["week_number"] == week_number)].copy()
+
+        for _, match in week_matches.iterrows():
+            home_team = match["home_team"]
+            away_team = match["away_team"]
+            hg = int(match["home_goals"])
+            ag = int(match["away_goals"])
+
+            for team in [home_team, away_team]:
+                if team not in cycle_stats:
+                    cycle_stats[team] = {
+                        "played": 0, "wins": 0, "draws": 0, "losses": 0,
+                        "goals_for": 0, "goals_against": 0, "points": 0,
+                        "form": [],
+                    }
+
+            # home
+            cycle_stats[home_team]["played"] += 1
+            cycle_stats[home_team]["goals_for"] += hg
+            cycle_stats[home_team]["goals_against"] += ag
+
+            # away
+            cycle_stats[away_team]["played"] += 1
+            cycle_stats[away_team]["goals_for"] += ag
+            cycle_stats[away_team]["goals_against"] += hg
+
+            if hg > ag:
+                cycle_stats[home_team]["wins"] += 1
+                cycle_stats[home_team]["points"] += 3
+                cycle_stats[home_team]["form"].append("W")
+
+                cycle_stats[away_team]["losses"] += 1
+                cycle_stats[away_team]["form"].append("L")
+            elif hg < ag:
+                cycle_stats[away_team]["wins"] += 1
+                cycle_stats[away_team]["points"] += 3
+                cycle_stats[away_team]["form"].append("W")
+
+                cycle_stats[home_team]["losses"] += 1
+                cycle_stats[home_team]["form"].append("L")
+            else:
+                cycle_stats[home_team]["draws"] += 1
+                cycle_stats[away_team]["draws"] += 1
+                cycle_stats[home_team]["points"] += 1
+                cycle_stats[away_team]["points"] += 1
+                cycle_stats[home_team]["form"].append("D")
+                cycle_stats[away_team]["form"].append("D")
+
+        table = []
+        for team, stt in cycle_stats.items():
+            form_last5_list = stt["form"][-5:]
+            form_string = "".join(form_last5_list)
+            form_points = sum(3 if x == "W" else 1 if x == "D" else 0 for x in form_last5_list)
+            table.append(
+                {
+                    "cycle_id": cycle_id,
+                    "week_number": week_number,
+                    "team": team,
+                    "played": int(stt["played"]),
+                    "wins": int(stt["wins"]),
+                    "draws": int(stt["draws"]),
+                    "losses": int(stt["losses"]),
+                    "goals_for": int(stt["goals_for"]),
+                    "goals_against": int(stt["goals_against"]),
+                    "goal_diff": int(stt["goals_for"] - stt["goals_against"]),
+                    "points": int(stt["points"]),
+                    "form_last5": form_string,
+                    "form_points_last5": int(form_points),
+                    "form_wins_last5": int(sum(x == "W" for x in form_last5_list)),
+                    "form_draws_last5": int(sum(x == "D" for x in form_last5_list)),
+                    "form_losses_last5": int(sum(x == "L" for x in form_last5_list)),
+                }
+            )
+
+        week_table = pd.DataFrame(table)
+        if week_table.empty:
+            continue
+        week_table = week_table.sort_values(
+            ["points", "goal_diff", "goals_for", "team"],
+            ascending=[False, False, False, True],
+        ).reset_index(drop=True)
+        week_table.insert(3, "rank", np.arange(1, len(week_table) + 1))
+        standings_rows.append(week_table[STANDINGS_COLUMNS])
+
+    if not standings_rows:
+        return pd.DataFrame(columns=STANDINGS_COLUMNS)
+
+    standings = pd.concat(standings_rows, ignore_index=True)
+    return standings
+
+
+def get_latest_prior_standing(standings_df: pd.DataFrame, team: str, cycle_id: int, week_number: int) -> Optional[pd.Series]:
     if standings_df.empty:
-        return base
-    s = standings_df.copy()
-    for col in ["cycle_id", "week_number", "snapshot_id"]:
-        s[col] = pd.to_numeric(s[col], errors="coerce")
-    eligible = s[(s["team"] == team) & ((s["cycle_id"] < cycle_id) | ((s["cycle_id"] == cycle_id) & (s["week_number"] < week_number)))]
-    if eligible.empty:
-        return base
-    latest = eligible.sort_values(STANDINGS_ORDER_COLUMNS).iloc[-1]
-    base.update({
-        f"{prefix}_rank": float(latest["rank"]),
-        f"{prefix}_points": float(latest["points"]),
-        f"{prefix}_form_wins_last5": float(latest["form_wins_last5"]),
-        f"{prefix}_form_draws_last5": float(latest["form_draws_last5"]),
-        f"{prefix}_form_losses_last5": float(latest["form_losses_last5"]),
-        f"{prefix}_form_points_last5": float(latest["form_points_last5"]),
-        f"{prefix}_standings_available": 1,
-    })
-    return base
+        return None
+
+    prior = standings_df[
+        (standings_df["team"] == team) &
+        (
+            (standings_df["cycle_id"] < cycle_id) |
+            ((standings_df["cycle_id"] == cycle_id) & (standings_df["week_number"] < week_number))
+        )
+    ].copy()
+
+    if prior.empty:
+        return None
+
+    prior = prior.sort_values(["cycle_id", "week_number"])
+    return prior.iloc[-1]
 
 
-def build_feature_dataset(master_df: pd.DataFrame, standings_df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+def standings_feature_dict(standing: Optional[pd.Series], prefix: str) -> dict:
+    if standing is None:
+        return {
+            f"{prefix}_rank": np.nan,
+            f"{prefix}_points": np.nan,
+            f"{prefix}_goal_diff": np.nan,
+            f"{prefix}_played": np.nan,
+            f"{prefix}_form_points_last5": np.nan,
+            f"{prefix}_form_wins_last5": np.nan,
+            f"{prefix}_form_draws_last5": np.nan,
+            f"{prefix}_form_losses_last5": np.nan,
+        }
+
+    return {
+        f"{prefix}_rank": float(standing["rank"]),
+        f"{prefix}_points": float(standing["points"]),
+        f"{prefix}_goal_diff": float(standing["goal_diff"]),
+        f"{prefix}_played": float(standing["played"]),
+        f"{prefix}_form_points_last5": float(standing["form_points_last5"]),
+        f"{prefix}_form_wins_last5": float(standing["form_wins_last5"]),
+        f"{prefix}_form_draws_last5": float(standing["form_draws_last5"]),
+        f"{prefix}_form_losses_last5": float(standing["form_losses_last5"]),
+    }
+
+
+def build_feature_dataset(master_df: pd.DataFrame, standings_df: pd.DataFrame) -> pd.DataFrame:
     if master_df.empty:
         return pd.DataFrame()
-    if standings_df is None:
-        standings_df = read_standings()
 
     df = master_df.copy()
     for col in ["cycle_id", "week_number", "batch_match_number", "global_order", "match_id", "home_goals", "away_goals", "total_goals"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
     df = df.sort_values(["global_order"]).reset_index(drop=True)
 
+    if standings_df is None or standings_df.empty:
+        standings_df = pd.DataFrame(columns=STANDINGS_COLUMNS)
+    else:
+        standings_df = standings_df.copy()
+        standings_df["cycle_id"] = pd.to_numeric(standings_df["cycle_id"], errors="coerce")
+        standings_df["week_number"] = pd.to_numeric(standings_df["week_number"], errors="coerce")
+
     rows = []
     for _, row in df.iterrows():
-        prior = df[(df["cycle_id"] < row["cycle_id"]) | ((df["cycle_id"] == row["cycle_id"]) & (df["week_number"] < row["week_number"]))].copy()
+        prior = df[
+            (df["cycle_id"] < row["cycle_id"]) |
+            ((df["cycle_id"] == row["cycle_id"]) & (df["week_number"] < row["week_number"]))
+        ].copy()
+
         home_hist = compute_team_history(prior, row["home_team"])
         away_hist = compute_team_history(prior, row["away_team"])
+        home_standing = get_latest_prior_standing(standings_df, row["home_team"], int(row["cycle_id"]), int(row["week_number"]))
+        away_standing = get_latest_prior_standing(standings_df, row["away_team"], int(row["cycle_id"]), int(row["week_number"]))
+
         feats = {
             "match_id": int(row["match_id"]),
             "cycle_id": int(row["cycle_id"]),
@@ -578,16 +641,36 @@ def build_feature_dataset(master_df: pd.DataFrame, standings_df: Optional[pd.Dat
         feats.update(summary_features_from_history(home_hist, "home_team"))
         feats.update(summary_features_from_history(away_hist, "away_team"))
         feats.update(head_to_head_features(prior, row["home_team"], row["away_team"]))
-        feats.update(standings_snapshot_features(standings_df, int(row["cycle_id"]), int(row["week_number"]), row["home_team"], "home_team"))
-        feats.update(standings_snapshot_features(standings_df, int(row["cycle_id"]), int(row["week_number"]), row["away_team"], "away_team"))
-        feats["rank_gap"] = np.nan if pd.isna(feats["home_team_rank"]) or pd.isna(feats["away_team_rank"]) else float(feats["home_team_rank"] - feats["away_team_rank"])
-        feats["points_gap"] = np.nan if pd.isna(feats["home_team_points"]) or pd.isna(feats["away_team_points"]) else float(feats["home_team_points"] - feats["away_team_points"])
-        feats["form_points_gap"] = np.nan if pd.isna(feats["home_team_form_points_last5"]) or pd.isna(feats["away_team_form_points_last5"]) else float(feats["home_team_form_points_last5"] - feats["away_team_form_points_last5"])
+        feats.update(standings_feature_dict(home_standing, "home_team"))
+        feats.update(standings_feature_dict(away_standing, "away_team"))
+
+        feats["standings_rank_gap"] = (
+            feats.get("home_team_rank", np.nan) - feats.get("away_team_rank", np.nan)
+            if pd.notna(feats.get("home_team_rank", np.nan)) and pd.notna(feats.get("away_team_rank", np.nan))
+            else np.nan
+        )
+        feats["standings_points_gap"] = (
+            feats.get("home_team_points", np.nan) - feats.get("away_team_points", np.nan)
+            if pd.notna(feats.get("home_team_points", np.nan)) and pd.notna(feats.get("away_team_points", np.nan))
+            else np.nan
+        )
+        feats["standings_goal_diff_gap"] = (
+            feats.get("home_team_goal_diff", np.nan) - feats.get("away_team_goal_diff", np.nan)
+            if pd.notna(feats.get("home_team_goal_diff", np.nan)) and pd.notna(feats.get("away_team_goal_diff", np.nan))
+            else np.nan
+        )
+        feats["standings_form_points_gap"] = (
+            feats.get("home_team_form_points_last5", np.nan) - feats.get("away_team_form_points_last5", np.nan)
+            if pd.notna(feats.get("home_team_form_points_last5", np.nan)) and pd.notna(feats.get("away_team_form_points_last5", np.nan))
+            else np.nan
+        )
+
         feats["target_total_goals"] = int(row["total_goals"])
         feats["target_total_class"] = total_goal_class(int(row["total_goals"]))
         rows.append(feats)
 
     feat_df = pd.DataFrame(rows)
+
     numeric_cols = feat_df.select_dtypes(include=[np.number]).columns.tolist()
     exclude = ["match_id", "cycle_id", "week_number", "batch_match_number", "global_order", "target_total_goals"]
     feature_num_cols = [c for c in numeric_cols if c not in exclude]
@@ -596,106 +679,88 @@ def build_feature_dataset(master_df: pd.DataFrame, standings_df: Optional[pd.Dat
         if miss.any():
             feat_df[f"{col}_missing"] = miss
             feat_df[col] = feat_df[col].fillna(0.0)
+
     return feat_df
 
 
-def append_standings(standings_new: pd.DataFrame) -> Tuple[pd.DataFrame, int, int]:
-    saved = read_standings()
-    if standings_new.empty:
-        return saved, 0, 0
-    standings_new = assign_cycle_ids_for_standings(saved, standings_new)
-    standings_new = standings_new.copy()
-    standings_new["standings_key"] = standings_new["cycle_id"].astype(int).astype(str) + "|" + standings_new["week_number"].astype(int).astype(str) + "|" + standings_new["team"]
-    existing_keys = set(saved["standings_key"].astype(str)) if not saved.empty else set()
-    dup_mask = standings_new["standings_key"].astype(str).isin(existing_keys)
-    accepted = standings_new[~dup_mask].copy()
-    duplicates = int(dup_mask.sum())
-    if accepted.empty:
-        return saved, 0, duplicates
-    next_snapshot_id = 1 if saved.empty else int(pd.to_numeric(saved["snapshot_id"], errors="coerce").dropna().max()) + 1
-    accepted = accepted.reset_index(drop=True)
-    accepted.insert(0, "snapshot_id", range(next_snapshot_id, next_snapshot_id + len(accepted)))
-    for col in STANDINGS_COLUMNS:
-        if col not in accepted.columns:
-            accepted[col] = np.nan
-    saved = pd.concat([saved, accepted[STANDINGS_COLUMNS]], ignore_index=True)
-    save_standings(saved)
-    return saved, len(accepted), duplicates
-
-
-def append_to_master(new_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, int, pd.DataFrame]:
+def append_to_master(new_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, int, pd.DataFrame, pd.DataFrame]:
     master = read_master()
-    standings_saved = read_standings()
     new_df = assign_cycle_ids(master, new_df)
+
     new_df["match_key"] = (
         new_df["cycle_id"].astype(int).astype(str) + "|" +
         new_df["week_number"].astype(int).astype(str) + "|" +
         new_df["home_team"] + "|" + new_df["away_team"] + "|" +
         new_df["home_goals"].astype(int).astype(str) + "|" + new_df["away_goals"].astype(int).astype(str)
     )
+
     existing_keys = set(master["match_key"].astype(str)) if not master.empty else set()
     duplicate_mask = new_df["match_key"].astype(str).isin(existing_keys)
     rejected_existing = new_df[duplicate_mask].copy()
     accepted = new_df[~duplicate_mask].copy()
+
     if accepted.empty:
-        features = build_feature_dataset(master, standings_saved)
+        standings = compute_standings_history(master)
+        features = build_feature_dataset(master, standings)
+        if not standings.empty:
+            save_standings(standings)
         if not features.empty:
             save_features(features)
-        return master, rejected_existing, 0, features
+        return master, rejected_existing, 0, features, standings
+
     next_match_id = 1 if master.empty else int(pd.to_numeric(master["match_id"], errors="coerce").dropna().max()) + 1
     next_global_order = 1 if master.empty else int(pd.to_numeric(master["global_order"], errors="coerce").dropna().max()) + 1
+
     accepted = accepted.reset_index(drop=True)
     accepted.insert(0, "match_id", range(next_match_id, next_match_id + len(accepted)))
     accepted.insert(5, "global_order", range(next_global_order, next_global_order + len(accepted)))
+
     for col in MASTER_COLUMNS:
         if col not in accepted.columns:
             accepted[col] = np.nan
+
     master = pd.concat([master, accepted[MASTER_COLUMNS]], ignore_index=True)
     for c in ["match_id", "cycle_id", "week_number", "batch_match_number", "global_order"]:
         master[c] = pd.to_numeric(master[c], errors="coerce")
     master = master.sort_values(FEATURE_ORDER_COLUMNS).reset_index(drop=True)
     save_master(master)
+
     if not rejected_existing.empty:
         append_rejected(rejected_existing)
-    features = build_feature_dataset(master, standings_saved)
+
+    standings = compute_standings_history(master)
+    save_standings(standings)
+
+    features = build_feature_dataset(master, standings)
     if not features.empty:
         save_features(features)
-    return master, rejected_existing, len(accepted), features
 
-
-def rebuild_features_from_saved() -> None:
-    master = read_master()
-    standings_saved = read_standings()
-    features = build_feature_dataset(master, standings_saved)
-    if not features.empty:
-        save_features(features)
-    elif FEATURES_PATH.exists():
-        FEATURES_PATH.unlink()
+    return master, rejected_existing, len(accepted), features, standings
 
 
 def get_notification_metrics() -> dict:
     master = read_master()
     features = pd.read_csv(FEATURES_PATH) if FEATURES_PATH.exists() else pd.DataFrame()
-    standings = read_standings()
+    standings = pd.read_csv(STANDINGS_PATH) if STANDINGS_PATH.exists() else pd.DataFrame()
     return {
         "master_rows": int(len(master)),
         "feature_rows": int(len(features)),
         "teams_seen": int(len(pd.unique(pd.concat([master["home_team"], master["away_team"]], ignore_index=True)))) if not master.empty else 0,
-        "cycles_seen": int(pd.to_numeric(master["cycle_id"], errors="coerce").dropna().max()) if not master.empty and pd.to_numeric(master["cycle_id"], errors="coerce").dropna().size else (int(pd.to_numeric(standings["cycle_id"], errors="coerce").dropna().max()) if not standings.empty and pd.to_numeric(standings["cycle_id"], errors="coerce").dropna().size else 0),
+        "cycles_seen": int(pd.to_numeric(master["cycle_id"], errors="coerce").dropna().max()) if not master.empty and pd.to_numeric(master["cycle_id"], errors="coerce").dropna().size else 0,
+        "standings_rows": int(len(standings)),
     }
 
 
+# ----------------------- UI -----------------------
 st.title("⚽ Soccer Results Dataset Builder")
-st.caption("Clean raw soccer results, detect week sections, store them in the correct time order, and export model-ready datasets with standings-aware features.")
+st.caption("Clean raw soccer results, detect week sections, compute standings automatically from results, and export model-ready datasets.")
 
 left, right = st.columns([4, 1])
 with left:
-    raw_text = st.text_area("Paste raw match input", height=260, placeholder="Paste the raw match results here...")
-    standings_text = st.text_area("Paste standings snapshot (optional)", height=180, placeholder="Paste a standings table here when available...")
+    raw_text = st.text_area("Paste raw input", height=320, placeholder="Paste the raw match results here...")
 with right:
     detected_week = parse_week_number_from_text(raw_text) if raw_text else None
-    week_number = st.number_input("Fallback match week", min_value=1, max_value=38, value=int(detected_week) if detected_week else 1, step=1)
-    standings_week_number = st.number_input("Standings week", min_value=1, max_value=38, value=int(detected_week) if detected_week else 1, step=1)
+    week_number = st.number_input("Fallback week number", min_value=1, max_value=38, value=int(detected_week) if detected_week else 1, step=1)
     batch_id = st.text_input("Batch id", value="batch_manual")
     process = st.button("Process and save", type="primary", use_container_width=True)
     refresh = st.button("Refresh system / start new dataset", use_container_width=True)
@@ -706,69 +771,47 @@ if refresh:
 
 st.subheader("Notifications dashboard")
 metrics = get_notification_metrics()
-m1, m2, m3, m4 = st.columns(4)
+m1, m2, m3, m4, m5 = st.columns(5)
 m1.metric("Master rows", metrics["master_rows"])
 m2.metric("Feature rows", metrics["feature_rows"])
 m3.metric("Teams seen", metrics["teams_seen"])
 m4.metric("Cycles seen", metrics["cycles_seen"])
+m5.metric("Standings rows", metrics["standings_rows"])
 
 if process:
-    if not raw_text.strip() and not standings_text.strip():
-        st.error("Paste some raw match input or standings input first.")
+    if not raw_text.strip():
+        st.error("Paste some raw input first.")
     else:
-        batch_hash = stable_batch_hash(raw_text, int(week_number), batch_id.strip() or "batch_manual", standings_text, int(standings_week_number))
+        batch_hash = stable_batch_hash(raw_text, int(week_number), batch_id.strip() or "batch_manual")
         if st.session_state.get("last_processed_hash") == batch_hash:
             last = st.session_state.get("last_processed_result", {})
-            st.warning("This exact input was already processed. No records were added again.")
+            st.warning("This exact batch was already processed. No records were added again.")
             if last:
-                st.info(f"Last result: matches accepted {last.get('accepted_matches', 0)}, standings accepted {last.get('accepted_standings', 0)}, existing duplicates {last.get('existing_duplicates', 0)}, warnings {last.get('warnings', 0)}.")
+                st.info(
+                    f"Last result: accepted {last.get('accepted', 0)}, existing duplicates {last.get('existing_duplicates', 0)}, warnings {last.get('warnings', 0)}."
+                )
         else:
-            warnings_total = []
-            standings_added = 0
-            standings_duplicates = 0
-            if standings_text.strip():
-                standings_df, standings_warnings = parse_standings_text(standings_text, int(standings_week_number))
-                warnings_total.extend(standings_warnings)
-                if standings_df.empty:
-                    st.warning("No valid standings rows were saved from the standings input.")
-                else:
-                    _, standings_added, standings_duplicates = append_standings(standings_df)
-                    rebuild_features_from_saved()
-            accepted_count = 0
-            rejected_existing = pd.DataFrame()
-            if raw_text.strip():
-                parsed_df, warnings = parse_matches(raw_text, int(week_number), batch_id.strip() or "batch_manual")
-                warnings_total.extend(warnings)
-                if parsed_df.empty:
-                    st.error("No valid matches were found after cleaning.")
-                else:
-                    _, rejected_existing, accepted_count, _ = append_to_master(parsed_df)
-            else:
-                rebuild_features_from_saved()
-
-            for msg in warnings_total:
+            parsed_df, warnings = parse_matches(raw_text, int(week_number), batch_id.strip() or "batch_manual")
+            for msg in warnings:
                 st.warning(msg)
 
-            st.session_state["last_processed_hash"] = batch_hash
-            st.session_state["last_processed_result"] = {
-                "accepted_matches": int(accepted_count),
-                "accepted_standings": int(standings_added),
-                "existing_duplicates": int(len(rejected_existing)) + int(standings_duplicates),
-                "warnings": int(len(warnings_total)),
-            }
+            if parsed_df.empty:
+                st.error("No valid matches were found after cleaning.")
+            else:
+                master_df, rejected_existing, accepted_count, features_df, standings_df = append_to_master(parsed_df)
+                st.session_state["last_processed_hash"] = batch_hash
+                st.session_state["last_processed_result"] = {
+                    "accepted": int(accepted_count),
+                    "existing_duplicates": int(len(rejected_existing)),
+                    "warnings": int(len(warnings)),
+                }
 
-            if accepted_count > 0:
-                st.success(f"Saved {accepted_count} new match(es).")
-            elif raw_text.strip():
-                st.info("All cleaned matches from this batch were already present in the saved history.")
-            if standings_text.strip():
-                if standings_added > 0:
-                    st.success(f"Saved {standings_added} new standings row(s).")
+                if accepted_count > 0:
+                    st.success(f"Saved {accepted_count} new match(es).")
                 else:
-                    st.info("All cleaned standings rows from this input were already present in saved history.")
-            dup_total = int(len(rejected_existing)) + int(standings_duplicates)
-            if dup_total > 0:
-                st.info(f"Ignored {dup_total} row(s) already present in saved history.")
+                    st.info("All cleaned matches from this batch were already present in the saved history.")
+                if len(rejected_existing) > 0:
+                    st.info(f"Ignored {len(rejected_existing)} match(es) already present in saved history.")
 
 master_download = MASTER_PATH.read_bytes() if MASTER_PATH.exists() else b""
 features_download = FEATURES_PATH.read_bytes() if FEATURES_PATH.exists() else b""
@@ -776,8 +819,29 @@ standings_download = STANDINGS_PATH.read_bytes() if STANDINGS_PATH.exists() else
 
 d1, d2, d3 = st.columns(3)
 with d1:
-    st.download_button("Download matches_master.csv", data=master_download, file_name="matches_master.csv", mime="text/csv", use_container_width=True, disabled=not bool(master_download))
+    st.download_button(
+        "Download matches_master.csv",
+        data=master_download,
+        file_name="matches_master.csv",
+        mime="text/csv",
+        use_container_width=True,
+        disabled=not bool(master_download),
+    )
 with d2:
-    st.download_button("Download matches_features.csv", data=features_download, file_name="matches_features.csv", mime="text/csv", use_container_width=True, disabled=not bool(features_download))
+    st.download_button(
+        "Download matches_features.csv",
+        data=features_download,
+        file_name="matches_features.csv",
+        mime="text/csv",
+        use_container_width=True,
+        disabled=not bool(features_download),
+    )
 with d3:
-    st.download_button("Download standings_history.csv", data=standings_download, file_name="standings_history.csv", mime="text/csv", use_container_width=True, disabled=not bool(standings_download))
+    st.download_button(
+        "Download standings_history.csv",
+        data=standings_download,
+        file_name="standings_history.csv",
+        mime="text/csv",
+        use_container_width=True,
+        disabled=not bool(standings_download),
+    )
