@@ -250,20 +250,31 @@ def read_standings() -> pd.DataFrame:
 def load_model_bundle() -> Optional[dict]:
     if MODEL_BUNDLE_PATH.exists():
         try:
-            return joblib.load(MODEL_BUNDLE_PATH)
+            bundle = joblib.load(MODEL_BUNDLE_PATH)
+            if bundle is None:
+                return None
+            # Backward compatibility with older single-model bundles
+            if "result_models" not in bundle and "result_model" in bundle:
+                bundle = {
+                    "result_models": [bundle["result_model"]],
+                    "total_models": [bundle["total_model"]],
+                    "result_model_weights": [1.0],
+                    "total_model_weights": [1.0],
+                    "feature_columns": bundle.get("feature_columns", []),
+                    "metrics": bundle.get("metrics", {}),
+                }
+            return bundle
         except Exception:
             return None
     return None
 
 
 def save_model_bundle(bundle: dict) -> None:
-    # Save only pickle-safe objects. The trained sklearn pipelines and plain metadata
-    # are serializable once all helper callables are top-level functions.
     safe_bundle = {
-        "result_rf_model": bundle.get("result_rf_model"),
-        "result_lr_model": bundle.get("result_lr_model"),
-        "total_rf_model": bundle.get("total_rf_model"),
-        "total_lr_model": bundle.get("total_lr_model"),
+        "result_models": bundle.get("result_models"),
+        "total_models": bundle.get("total_models"),
+        "result_model_weights": list(bundle.get("result_model_weights", [0.5, 0.5])),
+        "total_model_weights": list(bundle.get("total_model_weights", [0.5, 0.5])),
         "feature_columns": list(bundle.get("feature_columns", [])),
         "metrics": dict(bundle.get("metrics", {})),
     }
@@ -850,12 +861,20 @@ def next_cycle_week(master_df: pd.DataFrame) -> Tuple[int, int]:
     return cycle_id, week_number + 1
 
 
-def prepare_training_matrix(features_df: pd.DataFrame, master_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series, pd.Series]:
+def prepare_training_matrix(features_df: pd.DataFrame, master_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series, pd.Series, pd.DataFrame]:
     df = features_df.copy().sort_values("global_order").reset_index(drop=True)
     result_map_df = master_df[["match_id", "result"]].copy()
     merged = df.merge(result_map_df, on="match_id", how="left")
     merged["result_target"] = merged["result"].map(RESULT_CLASS_MAP)
-    merged["total_target"] = merged["target_total_class"].replace({"6_plus": "6"}).astype(str)
+    merged["total_target"] = merged["target_total_class"].replace({"6_plus": "6"})
+
+    # Keep only rows with fully valid training labels. This prevents sklearn from
+    # crashing on hidden missing targets after merges or legacy exports.
+    valid_mask = (
+        merged["result_target"].isin(RESULT_CLASS_ORDER) &
+        merged["total_target"].astype(str).isin(TOTAL_CLASS_ORDER)
+    )
+    merged = merged.loc[valid_mask].copy().reset_index(drop=True)
 
     drop_cols = {
         "match_id", "cycle_id", "week_number", "batch_match_number", "global_order",
@@ -865,9 +884,7 @@ def prepare_training_matrix(features_df: pd.DataFrame, master_df: pd.DataFrame) 
     X = merged[feature_cols].copy()
     y_result = merged["result_target"].astype(str)
     y_total = merged["total_target"].astype(str)
-    return X, y_result, y_total
-
-
+    return X, y_result, y_total, merged
 
 
 # Pickle-safe column selectors for sklearn ColumnTransformer
@@ -950,7 +967,18 @@ def train_models(features_df: pd.DataFrame, master_df: pd.DataFrame) -> Tuple[Op
         warnings.append(f"Need at least {MIN_ROWS_TO_TRAIN} feature rows before training. Current rows: {len(features_df)}.")
         return None, warnings
 
-    X, y_result, y_total = prepare_training_matrix(features_df, master_df)
+    X, y_result, y_total, merged_train = prepare_training_matrix(features_df, master_df)
+    if merged_train.empty:
+        warnings.append("No valid labeled rows were available after filtering invalid targets.")
+        return None, warnings
+
+    dropped_rows = len(features_df) - len(merged_train)
+    if dropped_rows > 0:
+        warnings.append(f"Skipped {dropped_rows} row(s) with invalid training targets before model fitting.")
+
+    if y_result.isna().any() or y_total.isna().any():
+        warnings.append("Training targets still contain missing values after filtering, so training was stopped.")
+        return None, warnings
     if y_result.nunique() < 3:
         warnings.append("Result model still needs all three classes (1, X, 2) represented.")
         return None, warnings
@@ -958,35 +986,54 @@ def train_models(features_df: pd.DataFrame, master_df: pd.DataFrame) -> Tuple[Op
         warnings.append("Total-goals model needs more class variety before training.")
         return None, warnings
 
-    ordered = features_df.sort_values("global_order").reset_index(drop=True)
+    ordered = merged_train.sort_values("global_order").reset_index(drop=True)
+    if len(ordered) < 50:
+        warnings.append("Not enough valid chronological rows to make a stable train/test split yet.")
+        return None, warnings
+
     split_idx = max(int(len(ordered) * 0.80), len(ordered) - max(20, len(ordered) // 5))
     split_idx = min(max(split_idx, 40), len(ordered) - 10)
-    train_idx = ordered.index[:split_idx]
-    test_idx = ordered.index[split_idx:]
 
-    X_train = X.iloc[train_idx]
-    X_test = X.iloc[test_idx]
-    yr_train = y_result.iloc[train_idx]
-    yr_test = y_result.iloc[test_idx]
-    yt_train = y_total.iloc[train_idx]
-    yt_test = y_total.iloc[test_idx]
+    X_ordered = X.loc[ordered.index].reset_index(drop=True)
+    yr_ordered = y_result.loc[ordered.index].reset_index(drop=True)
+    yt_ordered = y_total.loc[ordered.index].reset_index(drop=True)
+
+    X_train = X_ordered.iloc[:split_idx]
+    X_test = X_ordered.iloc[split_idx:]
+    yr_train = yr_ordered.iloc[:split_idx]
+    yr_test = yr_ordered.iloc[split_idx:]
+    yt_train = yt_ordered.iloc[:split_idx]
+    yt_test = yt_ordered.iloc[split_idx:]
+
+    # Final defensive check against any hidden NaNs reaching sklearn.
+    valid_result_train = ~yr_train.isna()
+    valid_total_train = ~yt_train.isna()
+    valid_result_test = ~yr_test.isna()
+    valid_total_test = ~yt_test.isna()
+    X_train_result = X_train.loc[valid_result_train]
+    yr_train = yr_train.loc[valid_result_train]
+    X_test_result = X_test.loc[valid_result_test]
+    yr_test = yr_test.loc[valid_result_test]
+    X_train_total = X_train.loc[valid_total_train]
+    yt_train = yt_train.loc[valid_total_train]
+    X_test_total = X_test.loc[valid_total_test]
+    yt_test = yt_test.loc[valid_total_test]
 
     result_rf_eval = build_rf_classifier()
     result_lr_eval = build_lr_classifier()
     total_rf_eval = build_rf_classifier()
     total_lr_eval = build_lr_classifier()
 
-    result_rf_eval.fit(X_train, yr_train)
-    result_lr_eval.fit(X_train, yr_train)
-    total_rf_eval.fit(X_train, yt_train)
-    total_lr_eval.fit(X_train, yt_train)
+    result_rf_eval.fit(X_train_result, yr_train)
+    result_lr_eval.fit(X_train_result, yr_train)
+    total_rf_eval.fit(X_train_total, yt_train)
+    total_lr_eval.fit(X_train_total, yt_train)
 
-    result_rf_acc = accuracy_score(yr_test, result_rf_eval.predict(X_test)) if len(X_test) else np.nan
-    result_lr_acc = accuracy_score(yr_test, result_lr_eval.predict(X_test)) if len(X_test) else np.nan
-    total_rf_acc = accuracy_score(yt_test, total_rf_eval.predict(X_test)) if len(X_test) else np.nan
-    total_lr_acc = accuracy_score(yt_test, total_lr_eval.predict(X_test)) if len(X_test) else np.nan
+    result_rf_acc = accuracy_score(yr_test, result_rf_eval.predict(X_test_result)) if len(X_test_result) else np.nan
+    result_lr_acc = accuracy_score(yr_test, result_lr_eval.predict(X_test_result)) if len(X_test_result) else np.nan
+    total_rf_acc = accuracy_score(yt_test, total_rf_eval.predict(X_test_total)) if len(X_test_total) else np.nan
+    total_lr_acc = accuracy_score(yt_test, total_lr_eval.predict(X_test_total)) if len(X_test_total) else np.nan
 
-    # Final fit on full data
     result_rf_model = build_rf_classifier()
     result_lr_model = build_lr_classifier()
     total_rf_model = build_rf_classifier()
@@ -996,25 +1043,28 @@ def train_models(features_df: pd.DataFrame, master_df: pd.DataFrame) -> Tuple[Op
     total_rf_model.fit(X, y_total)
     total_lr_model.fit(X, y_total)
 
+    result_weights_raw = np.array([
+        0.50 if np.isnan(result_rf_acc) else max(result_rf_acc, 0.05),
+        0.50 if np.isnan(result_lr_acc) else max(result_lr_acc, 0.05),
+    ], dtype=float)
+    total_weights_raw = np.array([
+        0.50 if np.isnan(total_rf_acc) else max(total_rf_acc, 0.05),
+        0.50 if np.isnan(total_lr_acc) else max(total_lr_acc, 0.05),
+    ], dtype=float)
+    result_model_weights = result_weights_raw / result_weights_raw.sum()
+    total_model_weights = total_weights_raw / total_weights_raw.sum()
+
     bundle = {
-        "result_rf_model": result_rf_model,
-        "result_lr_model": result_lr_model,
-        "total_rf_model": total_rf_model,
-        "total_lr_model": total_lr_model,
+        "result_models": [result_rf_model, result_lr_model],
+        "total_models": [total_rf_model, total_lr_model],
+        "result_model_weights": result_model_weights.tolist(),
+        "total_model_weights": total_model_weights.tolist(),
         "feature_columns": list(X.columns),
         "metrics": {
-            "result_rf_accuracy": None if np.isnan(result_rf_acc) else float(result_rf_acc),
-            "result_lr_accuracy": None if np.isnan(result_lr_acc) else float(result_lr_acc),
-            "total_rf_accuracy": None if np.isnan(total_rf_acc) else float(total_rf_acc),
-            "total_lr_accuracy": None if np.isnan(total_lr_acc) else float(total_lr_acc),
-            "result_accuracy": None if np.isnan(np.nanmean([result_rf_acc, result_lr_acc])) else float(np.nanmean([result_rf_acc, result_lr_acc])),
-            "total_accuracy": None if np.isnan(np.nanmean([total_rf_acc, total_lr_acc])) else float(np.nanmean([total_rf_acc, total_lr_acc])),
-            "result_rf_weight": holdout_weight_from_accuracy(result_rf_acc),
-            "result_lr_weight": holdout_weight_from_accuracy(result_lr_acc),
-            "total_rf_weight": holdout_weight_from_accuracy(total_rf_acc),
-            "total_lr_weight": holdout_weight_from_accuracy(total_lr_acc),
-            "result_model_weight": accuracy_to_weight(float(np.nanmean([result_rf_acc, result_lr_acc]))),
-            "total_model_weight": accuracy_to_weight(float(np.nanmean([total_rf_acc, total_lr_acc]))),
+            "result_accuracy": None if np.isnan(max(result_rf_acc, result_lr_acc)) else float(max(result_rf_acc, result_lr_acc)),
+            "total_accuracy": None if np.isnan(max(total_rf_acc, total_lr_acc)) else float(max(total_rf_acc, total_lr_acc)),
+            "result_model_weight": accuracy_to_weight(max(result_rf_acc, result_lr_acc)),
+            "total_model_weight": accuracy_to_weight(max(total_rf_acc, total_lr_acc)),
             "training_rows": int(len(X)),
             "trained_at": now_iso(),
         },
@@ -1119,32 +1169,28 @@ def blend_probabilities(model_probs: np.ndarray, market_probs: Optional[np.ndarr
 def generate_predictions(pred_input_df: pd.DataFrame, master_df: pd.DataFrame, standings_df: pd.DataFrame, bundle: dict) -> List[dict]:
     predictions = []
     next_cycle, next_week = next_cycle_week(master_df)
+    result_models = bundle.get("result_models", [])
+    total_models = bundle.get("total_models", [])
+    result_model_weights = np.array(bundle.get("result_model_weights", [1.0] * max(1, len(result_models))), dtype=float)
+    total_model_weights = np.array(bundle.get("total_model_weights", [1.0] * max(1, len(total_models))), dtype=float)
+    result_model_weights = result_model_weights / result_model_weights.sum() if result_model_weights.sum() > 0 else np.repeat(1.0 / max(1, len(result_models)), max(1, len(result_models)))
+    total_model_weights = total_model_weights / total_model_weights.sum() if total_model_weights.sum() > 0 else np.repeat(1.0 / max(1, len(total_models)), max(1, len(total_models)))
+
     for _, rec in pred_input_df.iterrows():
         home_team = rec["home_team"]
         away_team = rec["away_team"]
         row = build_prediction_feature_row(master_df, standings_df, home_team, away_team, next_cycle, next_week)
         aligned = align_prediction_row(row, bundle["feature_columns"])
 
-        result_rf = bundle["result_rf_model"]
-        result_lr = bundle["result_lr_model"]
-        total_rf = bundle["total_rf_model"]
-        total_lr = bundle["total_lr_model"]
+        result_model_probs = np.zeros(len(RESULT_CLASS_ORDER), dtype=float)
+        for model, weight in zip(result_models, result_model_weights):
+            probs = model.predict_proba(aligned)[0]
+            result_model_probs += weight * model_probs_to_order(model.classes_, probs, RESULT_CLASS_ORDER)
 
-        result_rf_probs = model_probs_to_order(result_rf.classes_, result_rf.predict_proba(aligned)[0], RESULT_CLASS_ORDER)
-        result_lr_probs = model_probs_to_order(result_lr.classes_, result_lr.predict_proba(aligned)[0], RESULT_CLASS_ORDER)
-        total_rf_probs = model_probs_to_order(total_rf.classes_, total_rf.predict_proba(aligned)[0], TOTAL_CLASS_ORDER)
-        total_lr_probs = model_probs_to_order(total_lr.classes_, total_lr.predict_proba(aligned)[0], TOTAL_CLASS_ORDER)
-
-        result_model_probs = weighted_average_probabilities(
-            result_rf_probs, result_lr_probs,
-            bundle["metrics"].get("result_rf_weight", 0.5),
-            bundle["metrics"].get("result_lr_weight", 0.5),
-        )
-        total_model_probs = weighted_average_probabilities(
-            total_rf_probs, total_lr_probs,
-            bundle["metrics"].get("total_rf_weight", 0.5),
-            bundle["metrics"].get("total_lr_weight", 0.5),
-        )
+        total_model_probs = np.zeros(len(TOTAL_CLASS_ORDER), dtype=float)
+        for model, weight in zip(total_models, total_model_weights):
+            probs = model.predict_proba(aligned)[0]
+            total_model_probs += weight * model_probs_to_order(model.classes_, probs, TOTAL_CLASS_ORDER)
 
         market_result_probs = normalized_inverse_odds([rec["odd_1"], rec["odd_X"], rec["odd_2"]])
         market_total_probs = normalized_inverse_odds([
@@ -1152,9 +1198,8 @@ def generate_predictions(pred_input_df: pd.DataFrame, master_df: pd.DataFrame, s
             rec["odd_total_4"], rec["odd_total_5"], rec["odd_total_6"],
         ])
 
-        # Use market more strongly when the trained model is still modest on holdout data.
-        result_probs = blend_probabilities(result_model_probs, market_result_probs, bundle["metrics"].get("result_model_weight", 0.5))
-        total_probs = blend_probabilities(total_model_probs, market_total_probs, bundle["metrics"].get("total_model_weight", 0.5))
+        result_probs = blend_probabilities(result_model_probs, market_result_probs, bundle["metrics"].get("result_model_weight", 0.68))
+        total_probs = blend_probabilities(total_model_probs, market_total_probs, bundle["metrics"].get("total_model_weight", 0.68))
 
         predictions.append(
             {
