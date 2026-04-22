@@ -919,7 +919,6 @@ def build_lr_classifier() -> Pipeline:
         multi_class="multinomial",
         class_weight="balanced",
         solver="lbfgs",
-        n_jobs=None,
     )
     return Pipeline([("prep", preprocessor), ("model", model)])
 
