@@ -923,26 +923,25 @@ def prepare_training_matrix(features_df: pd.DataFrame, master_df: pd.DataFrame) 
     return X, y_result, y_total, merged
 
 
-# Pickle-safe column selectors for sklearn ColumnTransformer
-def numeric_feature_selector(df: pd.DataFrame) -> List[str]:
-    return [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+# Use explicit column lists instead of callable selectors so the fitted pipelines
+# remain fully serializable with joblib on Streamlit deployments.
+def split_feature_columns(X: pd.DataFrame) -> Tuple[List[str], List[str]]:
+    numeric_cols = [c for c in X.columns if pd.api.types.is_numeric_dtype(X[c])]
+    categorical_cols = [c for c in X.columns if c not in numeric_cols]
+    return numeric_cols, categorical_cols
 
 
-def categorical_feature_selector(df: pd.DataFrame) -> List[str]:
-    return [c for c in df.columns if not pd.api.types.is_numeric_dtype(df[c])]
-
-
-def build_rf_classifier() -> Pipeline:
-    preprocessor = ColumnTransformer(
-        transformers=[
-            ("num", SimpleImputer(strategy="constant", fill_value=0.0), numeric_feature_selector),
-            ("cat", Pipeline([
-                ("impute", SimpleImputer(strategy="most_frequent")),
-                ("onehot", OneHotEncoder(handle_unknown="ignore")),
-            ]), categorical_feature_selector),
-        ],
-        remainder="drop",
-    )
+def build_rf_classifier(X: pd.DataFrame) -> Pipeline:
+    numeric_cols, categorical_cols = split_feature_columns(X)
+    transformers = []
+    if numeric_cols:
+        transformers.append(("num", SimpleImputer(strategy="constant", fill_value=0.0), numeric_cols))
+    if categorical_cols:
+        transformers.append(("cat", Pipeline([
+            ("impute", SimpleImputer(strategy="most_frequent")),
+            ("onehot", OneHotEncoder(handle_unknown="ignore")),
+        ]), categorical_cols))
+    preprocessor = ColumnTransformer(transformers=transformers, remainder="drop")
     model = RandomForestClassifier(
         n_estimators=320,
         max_depth=14,
@@ -954,20 +953,20 @@ def build_rf_classifier() -> Pipeline:
     return Pipeline([("prep", preprocessor), ("model", model)])
 
 
-def build_lr_classifier() -> Pipeline:
-    preprocessor = ColumnTransformer(
-        transformers=[
-            ("num", Pipeline([
-                ("impute", SimpleImputer(strategy="constant", fill_value=0.0)),
-                ("scale", StandardScaler(with_mean=False)),
-            ]), numeric_feature_selector),
-            ("cat", Pipeline([
-                ("impute", SimpleImputer(strategy="most_frequent")),
-                ("onehot", OneHotEncoder(handle_unknown="ignore")),
-            ]), categorical_feature_selector),
-        ],
-        remainder="drop",
-    )
+def build_lr_classifier(X: pd.DataFrame) -> Pipeline:
+    numeric_cols, categorical_cols = split_feature_columns(X)
+    transformers = []
+    if numeric_cols:
+        transformers.append(("num", Pipeline([
+            ("impute", SimpleImputer(strategy="constant", fill_value=0.0)),
+            ("scale", StandardScaler(with_mean=False)),
+        ]), numeric_cols))
+    if categorical_cols:
+        transformers.append(("cat", Pipeline([
+            ("impute", SimpleImputer(strategy="most_frequent")),
+            ("onehot", OneHotEncoder(handle_unknown="ignore")),
+        ]), categorical_cols))
+    preprocessor = ColumnTransformer(transformers=transformers, remainder="drop")
     model = LogisticRegression(
         max_iter=1400,
         class_weight="balanced",
@@ -1086,10 +1085,10 @@ def train_models(features_df: pd.DataFrame, master_df: pd.DataFrame) -> Tuple[Op
     X_test_total = X_test.loc[valid_total_test]
     yt_test = yt_test.loc[valid_total_test]
 
-    result_rf_eval = build_rf_classifier()
-    result_lr_eval = build_lr_classifier()
-    total_rf_eval = build_rf_classifier()
-    total_lr_eval = build_lr_classifier()
+    result_rf_eval = build_rf_classifier(X_train_result)
+    result_lr_eval = build_lr_classifier(X_train_result)
+    total_rf_eval = build_rf_classifier(X_train_total)
+    total_lr_eval = build_lr_classifier(X_train_total)
 
     result_rf_eval.fit(X_train_result, yr_train)
     result_lr_eval.fit(X_train_result, yr_train)
@@ -1101,10 +1100,10 @@ def train_models(features_df: pd.DataFrame, master_df: pd.DataFrame) -> Tuple[Op
     total_rf_acc = accuracy_score(yt_test, total_rf_eval.predict(X_test_total)) if len(X_test_total) else np.nan
     total_lr_acc = accuracy_score(yt_test, total_lr_eval.predict(X_test_total)) if len(X_test_total) else np.nan
 
-    result_rf_model = build_rf_classifier()
-    result_lr_model = build_lr_classifier()
-    total_rf_model = build_rf_classifier()
-    total_lr_model = build_lr_classifier()
+    result_rf_model = build_rf_classifier(X)
+    result_lr_model = build_lr_classifier(X)
+    total_rf_model = build_rf_classifier(X)
+    total_lr_model = build_lr_classifier(X)
     result_rf_model.fit(X, y_result)
     result_lr_model.fit(X, y_result)
     total_rf_model.fit(X, y_total)
