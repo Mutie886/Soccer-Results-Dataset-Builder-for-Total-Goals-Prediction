@@ -85,7 +85,8 @@ EXPECTED_HISTORY_COLUMNS = [
 
 RESULT_CLASS_MAP = {"H": "1", "D": "X", "A": "2"}
 RESULT_CLASS_ORDER = ["1", "X", "2"]
-TOTAL_CLASS_ORDER = ["0", "1", "2", "3", "4", "5", "6"]
+TOTAL_CLASS_ORDER = ["LOW", "MEDIUM", "HIGH"]
+TOTAL_CLASS_LABELS = {"LOW": "0-1", "MEDIUM": "2-3", "HIGH": "4+"}
 MIN_ROWS_TO_TRAIN = 60
 
 
@@ -139,6 +140,14 @@ def result_code(home_goals: int, away_goals: int) -> str:
 
 def total_goal_class(total_goals: int) -> str:
     return str(total_goals) if total_goals <= 6 else "6"
+
+
+def total_goal_bucket(total_goals: int) -> str:
+    if total_goals <= 1:
+        return "LOW"
+    if total_goals <= 3:
+        return "MEDIUM"
+    return "HIGH"
 
 
 def parse_week_number_from_text(raw_text: str) -> Optional[int]:
@@ -866,7 +875,7 @@ def prepare_training_matrix(features_df: pd.DataFrame, master_df: pd.DataFrame) 
     result_map_df = master_df[["match_id", "result"]].copy()
     merged = df.merge(result_map_df, on="match_id", how="left")
     merged["result_target"] = merged["result"].map(RESULT_CLASS_MAP)
-    merged["total_target"] = merged["target_total_class"].replace({"6_plus": "6"})
+    merged["total_target"] = merged["target_total_goals"].apply(lambda x: total_goal_bucket(int(x)) if pd.notna(x) else np.nan)
 
     # Keep only rows with fully valid training labels. This prevents sklearn from
     # crashing on hidden missing targets after merges or legacy exports.
@@ -982,8 +991,8 @@ def train_models(features_df: pd.DataFrame, master_df: pd.DataFrame) -> Tuple[Op
     if y_result.nunique() < 3:
         warnings.append("Result model still needs all three classes (1, X, 2) represented.")
         return None, warnings
-    if y_total.nunique() < 4:
-        warnings.append("Total-goals model needs more class variety before training.")
+    if y_total.nunique() < 3:
+        warnings.append("Total-goals model still needs all three classes (0-1, 2-3, 4+) represented.")
         return None, warnings
 
     ordered = merged_train.sort_values("global_order").reset_index(drop=True)
@@ -1193,10 +1202,16 @@ def generate_predictions(pred_input_df: pd.DataFrame, master_df: pd.DataFrame, s
             total_model_probs += weight * model_probs_to_order(model.classes_, probs, TOTAL_CLASS_ORDER)
 
         market_result_probs = normalized_inverse_odds([rec["odd_1"], rec["odd_X"], rec["odd_2"]])
-        market_total_probs = normalized_inverse_odds([
+        exact_market_total_probs = normalized_inverse_odds([
             rec["odd_total_0"], rec["odd_total_1"], rec["odd_total_2"], rec["odd_total_3"],
             rec["odd_total_4"], rec["odd_total_5"], rec["odd_total_6"],
         ])
+        market_total_probs = np.array([
+            exact_market_total_probs[0] + exact_market_total_probs[1],
+            exact_market_total_probs[2] + exact_market_total_probs[3],
+            exact_market_total_probs[4] + exact_market_total_probs[5] + exact_market_total_probs[6],
+        ], dtype=float)
+        market_total_probs = market_total_probs / market_total_probs.sum() if market_total_probs.sum() > 0 else np.repeat(1.0 / len(market_total_probs), len(market_total_probs))
 
         result_probs = blend_probabilities(result_model_probs, market_result_probs, bundle["metrics"].get("result_model_weight", 0.68))
         total_probs = blend_probabilities(total_model_probs, market_total_probs, bundle["metrics"].get("total_model_weight", 0.68))
@@ -1258,7 +1273,7 @@ def render_prediction_cards(predictions: List[dict]) -> None:
                     for label in RESULT_CLASS_ORDER
                 )
                 total_html = "".join(
-                    f'<div class="prob-chip"><div class="prob-label">{label}</div><div class="prob-value">{fmt_pct(total_probs[label])}</div></div>'
+                    f'<div class="prob-chip"><div class="prob-label">{TOTAL_CLASS_LABELS[label]}</div><div class="prob-value">{fmt_pct(total_probs[label])}</div></div>'
                     for label in TOTAL_CLASS_ORDER
                 )
                 st.markdown(
@@ -1270,7 +1285,7 @@ def render_prediction_cards(predictions: List[dict]) -> None:
                         <div class="subhead">Total goals probabilities</div>
                         <div class="prob-grid total">{total_html}</div>
                         <div class="pick-line"><strong>Most likely result:</strong> {pred['best_result']}</div>
-                        <div class="pick-line"><strong>Most likely total goals:</strong> {pred['best_total']}</div>
+                        <div class="pick-line"><strong>Most likely total-goals class:</strong> {TOTAL_CLASS_LABELS[pred['best_total']]}</div>
                     </div>
                     ''',
                     unsafe_allow_html=True,
@@ -1281,7 +1296,7 @@ def render_prediction_cards(predictions: List[dict]) -> None:
 # UI
 # =========================
 st.title("⚽ Soccer Total Goals Prediction System")
-st.caption("Train from continuous results updates, retrain after each week update, and make optional on-demand multiclass predictions.")
+st.caption("Train from continuous results updates, retrain after each week update, and make optional on-demand predictions for result and 3-class total-goals buckets.")
 
 # Controls area
 left, right = st.columns([1.15, 1.0], gap="large")
