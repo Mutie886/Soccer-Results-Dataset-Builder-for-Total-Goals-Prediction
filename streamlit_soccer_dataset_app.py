@@ -131,6 +131,10 @@ def read_master() -> pd.DataFrame:
 
 
 def save_master(df: pd.DataFrame) -> None:
+    for col in MASTER_COLUMNS:
+        if col not in df.columns:
+            df[col] = np.nan
+    df = df[MASTER_COLUMNS].copy()
     df.to_csv(MASTER_PATH, index=False)
 
 
@@ -301,7 +305,10 @@ def apply_total_goal_cycle_counters(master_df: pd.DataFrame) -> pd.DataFrame:
                 else:
                     team_counters[team][g] += 1
                 df.at[idx, f"{side}_tg_{g}_counter"] = team_counters[team][g]
-    return df
+    for col in MASTER_COLUMNS:
+        if col not in df.columns:
+            df[col] = np.nan
+    return df[MASTER_COLUMNS].copy()
 
 
 def append_to_master(new_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, int]:
