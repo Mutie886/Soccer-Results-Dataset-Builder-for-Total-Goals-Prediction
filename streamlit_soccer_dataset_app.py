@@ -86,7 +86,7 @@ EXPECTED_HISTORY_COLUMNS = [
 RESULT_CLASS_MAP = {"H": "1", "D": "X", "A": "2"}
 RESULT_CLASS_ORDER = ["1", "X", "2"]
 TOTAL_CLASS_ORDER = ["0-1", "2-3", "4+"]
-TOTAL_CLASS_LABELS = {"LOW": "0-1", "MEDIUM": "2-3", "HIGH": "4+"}
+TOTAL_CLASS_LABELS = {"0-1": "0-1", "2-3": "2-3", "4+": "4+", "LOW": "0-1", "MEDIUM": "2-3", "HIGH": "4+"}
 MIN_ROWS_TO_TRAIN = 60
 
 
