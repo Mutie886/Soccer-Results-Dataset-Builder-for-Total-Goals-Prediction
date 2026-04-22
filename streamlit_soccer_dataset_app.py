@@ -15,6 +15,7 @@ DATA_DIR = Path("data_store")
 DATA_DIR.mkdir(exist_ok=True)
 MASTER_PATH = DATA_DIR / "matches_master.csv"
 STATE_PATH = DATA_DIR / "system_state.json"
+TG_SUMMARY_PATH = DATA_DIR / "tg_summary_history.csv"
 
 TOTAL_GOAL_VALUES = list(range(7))  # 0..6 where 6 means 6+
 MASTER_COLUMNS = [
@@ -25,6 +26,15 @@ MASTER_COLUMNS = [
 for side in ["home_team", "away_team"]:
     for g in TOTAL_GOAL_VALUES:
         MASTER_COLUMNS.append(f"{side}_tg_{g}_counter")
+
+TG_SUMMARY_COLUMNS = [
+    "cycle_id", "week_number", "team",
+    *[f"current_tg_{g}" for g in TOTAL_GOAL_VALUES],
+    *[f"max_tg_{g}" for g in TOTAL_GOAL_VALUES],
+    *[f"avg_gap_tg_{g}" for g in TOTAL_GOAL_VALUES],
+    *[f"freq_tg_{g}" for g in TOTAL_GOAL_VALUES],
+    "most_frequent_tg", "highest_frequency"
+]
 
 st.markdown(
     """
@@ -105,7 +115,7 @@ def save_state(state: dict) -> None:
 
 
 def reset_system() -> None:
-    for path in [MASTER_PATH, STATE_PATH]:
+    for path in [MASTER_PATH, TG_SUMMARY_PATH, STATE_PATH]:
         if path.exists():
             path.unlink()
     for key in ["last_results_hash", "last_results_result"]:
@@ -136,6 +146,23 @@ def save_master(df: pd.DataFrame) -> None:
             df[col] = np.nan
     df = df[MASTER_COLUMNS].copy()
     df.to_csv(MASTER_PATH, index=False)
+
+def save_tg_summary(df: pd.DataFrame) -> None:
+    for col in TG_SUMMARY_COLUMNS:
+        if col not in df.columns:
+            df[col] = np.nan
+    df = df[TG_SUMMARY_COLUMNS].copy()
+    df.to_csv(TG_SUMMARY_PATH, index=False)
+
+
+def read_tg_summary() -> pd.DataFrame:
+    if TG_SUMMARY_PATH.exists():
+        df = pd.read_csv(TG_SUMMARY_PATH)
+        for col in TG_SUMMARY_COLUMNS:
+            if col not in df.columns:
+                df[col] = np.nan
+        return df[TG_SUMMARY_COLUMNS]
+    return pd.DataFrame(columns=TG_SUMMARY_COLUMNS)
 
 
 def split_input_into_week_sections(raw_text: str, fallback_week_number: int) -> List[Tuple[int, List[str]]]:
@@ -346,6 +373,7 @@ def append_to_master(new_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, 
     master = master.sort_values("global_order").reset_index(drop=True)
     master = apply_total_goal_cycle_counters(master)
     save_master(master)
+    save_tg_summary(build_team_tg_summary_history(master))
     return master, rejected_existing, len(accepted)
 
 
@@ -442,6 +470,61 @@ def build_team_tg_summary(master_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Dat
     )
 
 
+
+def build_team_tg_summary_history(master_df: pd.DataFrame) -> pd.DataFrame:
+    if master_df.empty:
+        return pd.DataFrame(columns=TG_SUMMARY_COLUMNS)
+
+    df = master_df.copy().sort_values(["global_order"]).reset_index(drop=True)
+    teams = sorted(pd.unique(pd.concat([df["home_team"], df["away_team"]], ignore_index=True)))
+    current_map: Dict[str, Dict[int, int]] = {t: {g: 0 for g in TOTAL_GOAL_VALUES} for t in teams}
+    max_map: Dict[str, Dict[int, int]] = {t: {g: 0 for g in TOTAL_GOAL_VALUES} for t in teams}
+    freq_map: Dict[str, Dict[int, int]] = {t: {g: 0 for g in TOTAL_GOAL_VALUES} for t in teams}
+    gap_lists: Dict[str, Dict[int, List[int]]] = {t: {g: [] for g in TOTAL_GOAL_VALUES} for t in teams}
+    current_cycle = None
+    summary_rows = []
+
+    def reset_cycle_maps():
+        for t in teams:
+            current_map[t] = {g: 0 for g in TOTAL_GOAL_VALUES}
+            max_map[t] = {g: 0 for g in TOTAL_GOAL_VALUES}
+            freq_map[t] = {g: 0 for g in TOTAL_GOAL_VALUES}
+            gap_lists[t] = {g: [] for g in TOTAL_GOAL_VALUES}
+
+    ordered_weeks = df[["cycle_id", "week_number"]].drop_duplicates().sort_values(["cycle_id", "week_number"]).itertuples(index=False)
+    for wk in ordered_weeks:
+        cycle_id, week_number = int(wk.cycle_id), int(wk.week_number)
+        if current_cycle is None or cycle_id != current_cycle:
+            current_cycle = cycle_id
+            reset_cycle_maps()
+        week_matches = df[(df["cycle_id"] == cycle_id) & (df["week_number"] == week_number)].sort_values("global_order")
+        for _, row in week_matches.iterrows():
+            bucket = int(row["total_goals_bucket"])
+            for team in [row["home_team"], row["away_team"]]:
+                for g in TOTAL_GOAL_VALUES:
+                    if g == bucket:
+                        prev_val = current_map[team][g]
+                        if prev_val > 0:
+                            gap_lists[team][g].append(prev_val)
+                        current_map[team][g] = 1
+                        freq_map[team][g] += 1
+                    else:
+                        current_map[team][g] += 1
+                    if current_map[team][g] > max_map[team][g]:
+                        max_map[team][g] = current_map[team][g]
+        for team in teams:
+            row = {"cycle_id": cycle_id, "week_number": week_number, "team": team}
+            for g in TOTAL_GOAL_VALUES:
+                row[f"current_tg_{g}"] = current_map[team][g]
+                row[f"max_tg_{g}"] = max_map[team][g]
+                row[f"avg_gap_tg_{g}"] = round(float(np.mean(gap_lists[team][g])), 2) if gap_lists[team][g] else 0.0
+                row[f"freq_tg_{g}"] = freq_map[team][g]
+            most_freq_bucket = min(TOTAL_GOAL_VALUES, key=lambda g: (-freq_map[team][g], g))
+            row["most_frequent_tg"] = most_freq_bucket
+            row["highest_frequency"] = freq_map[team][most_freq_bucket]
+            summary_rows.append(row)
+    return pd.DataFrame(summary_rows, columns=TG_SUMMARY_COLUMNS)
+
 def get_notification_metrics() -> dict:
     master = read_master()
     latest_cycle = 0
@@ -529,6 +612,7 @@ if process_results:
                     st.info(f"Ignored {len(rejected_existing)} match(es) already present in saved history.")
 
 master_df = read_master()
+summary_history_df = read_tg_summary()
 current_df, max_df, avg_df, freq_df = build_team_tg_summary(master_df)
 
 st.markdown('<div class="main-card"><div class="section-title">Current TG pass dashboard</div><div class="caption-small">Each TG column shows the latest running counter for that team. A hit resets that TG to 1; every miss increments it.</div></div>', unsafe_allow_html=True)
@@ -555,7 +639,14 @@ if freq_df.empty:
 else:
     st.dataframe(freq_df, use_container_width=True, hide_index=True)
 
+st.markdown('<div class="main-card"><div class="section-title">Continuous weekly TG summary records</div><div class="caption-small">This keeps a week-by-week record for every team of the current TG counters, maximum passes, average repeat gaps, and TG frequencies.</div></div>', unsafe_allow_html=True)
+if summary_history_df.empty:
+    st.info("No continuous weekly summary records yet.")
+else:
+    st.dataframe(summary_history_df, use_container_width=True, hide_index=True)
+
 master_download = MASTER_PATH.read_bytes() if MASTER_PATH.exists() else b""
+summary_download = TG_SUMMARY_PATH.read_bytes() if TG_SUMMARY_PATH.exists() else b""
 reqs_bytes = b"streamlit\npandas\nnumpy\n"
 
 st.markdown('<div class="main-card"><div class="section-title">Downloads</div><div class="caption-small">matches_master.csv includes only the core match columns plus the TG0 to TG6 current counters for home and away teams.</div></div>', unsafe_allow_html=True)
@@ -563,4 +654,14 @@ d1, d2 = st.columns(2)
 with d1:
     st.download_button("Download matches_master.csv", data=master_download, file_name="matches_master.csv", mime="text/csv", use_container_width=True, disabled=not bool(master_download))
 with d2:
+    st.download_button("Download requirements.txt", data=reqs_bytes, file_name="requirements.txt", mime="text/plain", use_container_width=True)
+
+
+st.markdown('<div class="main-card"><div class="section-title">Downloads</div><div class="caption-small">Download the enriched match dataset and the continuous weekly TG summary history.</div></div>', unsafe_allow_html=True)
+d1, d2, d3 = st.columns(3)
+with d1:
+    st.download_button("Download matches_master.csv", data=master_download, file_name="matches_master.csv", mime="text/csv", use_container_width=True, disabled=not bool(master_download))
+with d2:
+    st.download_button("Download tg_summary_history.csv", data=summary_download, file_name="tg_summary_history.csv", mime="text/csv", use_container_width=True, disabled=not bool(summary_download))
+with d3:
     st.download_button("Download requirements.txt", data=reqs_bytes, file_name="requirements.txt", mime="text/plain", use_container_width=True)
