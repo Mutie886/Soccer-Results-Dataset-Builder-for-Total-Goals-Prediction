@@ -85,7 +85,8 @@ EXPECTED_HISTORY_COLUMNS = [
 
 RESULT_CLASS_MAP = {"H": "1", "D": "X", "A": "2"}
 RESULT_CLASS_ORDER = ["1", "X", "2"]
-TOTAL_CLASS_ORDER = ["0", "1", "2", "3", "4", "5", "6"]
+TOTAL_CLASS_ORDER = ["0-1", "2-3", "4+"]
+TOTAL_CLASS_LABELS = {"LOW": "0-1", "MEDIUM": "2-3", "HIGH": "4+"}
 MIN_ROWS_TO_TRAIN = 60
 
 
@@ -139,6 +140,14 @@ def result_code(home_goals: int, away_goals: int) -> str:
 
 def total_goal_class(total_goals: int) -> str:
     return str(total_goals) if total_goals <= 6 else "6"
+
+
+def total_goal_bucket(total_goals: int) -> str:
+    if total_goals <= 1:
+        return "LOW"
+    if total_goals <= 3:
+        return "MEDIUM"
+    return "HIGH"
 
 
 def parse_week_number_from_text(raw_text: str) -> Optional[int]:
@@ -701,37 +710,51 @@ def add_gap_features(feats: dict) -> dict:
     return feats
 
 
-def add_interaction_features(feats: dict) -> dict:
-    def diff(a: str, b: str, out: str) -> None:
-        av, bv = feats.get(a, np.nan), feats.get(b, np.nan)
-        feats[out] = av - bv if pd.notna(av) and pd.notna(bv) else np.nan
+def add_matchup_interaction_features(feats: dict) -> dict:
+    hs = feats.get("home_team_home_last5_avg_scored", np.nan)
+    hc = feats.get("home_team_home_last5_avg_conceded", np.nan)
+    as_ = feats.get("away_team_away_last5_avg_scored", np.nan)
+    ac = feats.get("away_team_away_last5_avg_conceded", np.nan)
+    h_last5_scored = feats.get("home_team_last5_avg_scored", np.nan)
+    h_last5_conceded = feats.get("home_team_last5_avg_conceded", np.nan)
+    a_last5_scored = feats.get("away_team_last5_avg_scored", np.nan)
+    a_last5_conceded = feats.get("away_team_last5_avg_conceded", np.nan)
 
-    diff("home_team_last5_avg_scored", "away_team_last5_avg_scored", "attack_last5_gap")
-    diff("home_team_last5_avg_conceded", "away_team_last5_avg_conceded", "defense_last5_gap")
-    diff("home_team_last10_avg_scored", "away_team_last10_avg_scored", "attack_last10_gap")
-    diff("home_team_last10_avg_conceded", "away_team_last10_avg_conceded", "defense_last10_gap")
-    diff("home_team_home_last5_avg_scored", "away_team_away_last5_avg_scored", "venue_attack_gap")
-    diff("home_team_home_last5_avg_conceded", "away_team_away_last5_avg_conceded", "venue_defense_gap")
-    diff("home_team_last5_over_2_5_rate", "away_team_last5_over_2_5_rate", "over25_rate_gap")
-    diff("home_team_last5_over_3_5_rate", "away_team_last5_over_3_5_rate", "over35_rate_gap")
-    diff("home_team_form_points_last5", "away_team_form_points_last5", "form_points_gap_derived")
-
-    hs = feats.get("home_team_last5_avg_scored", np.nan)
-    ac = feats.get("away_team_last5_avg_conceded", np.nan)
-    as_ = feats.get("away_team_last5_avg_scored", np.nan)
-    hc = feats.get("home_team_last5_avg_conceded", np.nan)
-    if pd.notna(hs) and pd.notna(ac):
-        feats["home_attack_vs_away_defense"] = (hs + ac) / 2.0
-    else:
-        feats["home_attack_vs_away_defense"] = np.nan
-    if pd.notna(as_) and pd.notna(hc):
-        feats["away_attack_vs_home_defense"] = (as_ + hc) / 2.0
-    else:
-        feats["away_attack_vs_home_defense"] = np.nan
-    if pd.notna(feats.get("home_attack_vs_away_defense", np.nan)) and pd.notna(feats.get("away_attack_vs_home_defense", np.nan)):
-        feats["combined_expected_goal_signal"] = feats["home_attack_vs_away_defense"] + feats["away_attack_vs_home_defense"]
-    else:
-        feats["combined_expected_goal_signal"] = np.nan
+    feats["matchup_home_attack_vs_away_defense"] = np.nanmean([hs, a_last5_conceded, ac])
+    feats["matchup_away_attack_vs_home_defense"] = np.nanmean([as_, h_last5_conceded, hc])
+    feats["matchup_expected_total_proxy"] = np.nanmean([
+        feats["matchup_home_attack_vs_away_defense"],
+        feats["matchup_away_attack_vs_home_defense"],
+        feats.get("home_team_last5_avg_total_goals", np.nan),
+        feats.get("away_team_last5_avg_total_goals", np.nan),
+        feats.get("h2h_last3_avg_total_goals", np.nan),
+    ])
+    feats["matchup_goal_pressure"] = np.nanmean([
+        feats.get("home_team_last5_over_2_5_rate", np.nan),
+        feats.get("away_team_last5_over_2_5_rate", np.nan),
+        feats.get("home_team_last5_over_3_5_rate", np.nan),
+        feats.get("away_team_last5_over_3_5_rate", np.nan),
+    ])
+    feats["matchup_form_tilt"] = np.nanmean([
+        feats.get("standings_points_gap", np.nan),
+        feats.get("standings_goal_diff_gap", np.nan),
+        feats.get("standings_form_points_gap", np.nan),
+    ])
+    feats["matchup_home_not_lose_signal"] = np.nanmean([
+        feats.get("home_team_last5_win_rate", np.nan),
+        1.0 - feats.get("away_team_last5_loss_rate", np.nan) if pd.notna(feats.get("away_team_last5_loss_rate", np.nan)) else np.nan,
+        feats.get("h2h_home_team_win_rate", np.nan),
+    ])
+    feats["matchup_away_not_lose_signal"] = np.nanmean([
+        feats.get("away_team_last5_win_rate", np.nan),
+        1.0 - feats.get("home_team_last5_loss_rate", np.nan) if pd.notna(feats.get("home_team_last5_loss_rate", np.nan)) else np.nan,
+        feats.get("h2h_away_team_win_rate", np.nan),
+    ])
+    feats["matchup_draw_signal"] = np.nanmean([
+        feats.get("home_team_last5_draw_rate", np.nan),
+        feats.get("away_team_last5_draw_rate", np.nan),
+        feats.get("h2h_draw_rate", np.nan),
+    ])
     return feats
 
 
@@ -784,7 +807,7 @@ def build_feature_dataset(master_df: pd.DataFrame, standings_df: pd.DataFrame) -
         feats.update(standings_feature_dict(home_standing, "home_team"))
         feats.update(standings_feature_dict(away_standing, "away_team"))
         add_gap_features(feats)
-        add_interaction_features(feats)
+        add_matchup_interaction_features(feats)
         feats["target_total_goals"] = int(row["total_goals"])
         feats["target_total_class"] = total_goal_class(int(row["total_goals"]))
         rows.append(feats)
@@ -820,7 +843,7 @@ def build_prediction_feature_row(master_df: pd.DataFrame, standings_df: pd.DataF
     feats.update(standings_feature_dict(home_standing, "home_team"))
     feats.update(standings_feature_dict(away_standing, "away_team"))
     add_gap_features(feats)
-    add_interaction_features(feats)
+    add_matchup_interaction_features(feats)
     row = pd.DataFrame([feats])
     row = fill_missing_and_flags(row)
     return row
@@ -902,7 +925,7 @@ def prepare_training_matrix(features_df: pd.DataFrame, master_df: pd.DataFrame) 
     result_map_df = master_df[["match_id", "result"]].copy()
     merged = df.merge(result_map_df, on="match_id", how="left")
     merged["result_target"] = merged["result"].map(RESULT_CLASS_MAP)
-    merged["total_target"] = merged["target_total_class"].replace({"6_plus": "6"})
+    merged["total_target"] = merged["target_total_goals"].apply(lambda x: total_goal_bucket(int(x)) if pd.notna(x) else np.nan)
 
     # Keep only rows with fully valid training labels. This prevents sklearn from
     # crashing on hidden missing targets after merges or legacy exports.
@@ -923,25 +946,26 @@ def prepare_training_matrix(features_df: pd.DataFrame, master_df: pd.DataFrame) 
     return X, y_result, y_total, merged
 
 
-# Use explicit column lists instead of callable selectors so the fitted pipelines
-# remain fully serializable with joblib on Streamlit deployments.
-def split_feature_columns(X: pd.DataFrame) -> Tuple[List[str], List[str]]:
-    numeric_cols = [c for c in X.columns if pd.api.types.is_numeric_dtype(X[c])]
-    categorical_cols = [c for c in X.columns if c not in numeric_cols]
-    return numeric_cols, categorical_cols
+# Pickle-safe column selectors for sklearn ColumnTransformer
+def numeric_feature_selector(df: pd.DataFrame) -> List[str]:
+    return [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
 
 
-def build_rf_classifier(X: pd.DataFrame) -> Pipeline:
-    numeric_cols, categorical_cols = split_feature_columns(X)
-    transformers = []
-    if numeric_cols:
-        transformers.append(("num", SimpleImputer(strategy="constant", fill_value=0.0), numeric_cols))
-    if categorical_cols:
-        transformers.append(("cat", Pipeline([
-            ("impute", SimpleImputer(strategy="most_frequent")),
-            ("onehot", OneHotEncoder(handle_unknown="ignore")),
-        ]), categorical_cols))
-    preprocessor = ColumnTransformer(transformers=transformers, remainder="drop")
+def categorical_feature_selector(df: pd.DataFrame) -> List[str]:
+    return [c for c in df.columns if not pd.api.types.is_numeric_dtype(df[c])]
+
+
+def build_rf_classifier() -> Pipeline:
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ("num", SimpleImputer(strategy="constant", fill_value=0.0), numeric_feature_selector),
+            ("cat", Pipeline([
+                ("impute", SimpleImputer(strategy="most_frequent")),
+                ("onehot", OneHotEncoder(handle_unknown="ignore")),
+            ]), categorical_feature_selector),
+        ],
+        remainder="drop",
+    )
     model = RandomForestClassifier(
         n_estimators=320,
         max_depth=14,
@@ -953,20 +977,20 @@ def build_rf_classifier(X: pd.DataFrame) -> Pipeline:
     return Pipeline([("prep", preprocessor), ("model", model)])
 
 
-def build_lr_classifier(X: pd.DataFrame) -> Pipeline:
-    numeric_cols, categorical_cols = split_feature_columns(X)
-    transformers = []
-    if numeric_cols:
-        transformers.append(("num", Pipeline([
-            ("impute", SimpleImputer(strategy="constant", fill_value=0.0)),
-            ("scale", StandardScaler(with_mean=False)),
-        ]), numeric_cols))
-    if categorical_cols:
-        transformers.append(("cat", Pipeline([
-            ("impute", SimpleImputer(strategy="most_frequent")),
-            ("onehot", OneHotEncoder(handle_unknown="ignore")),
-        ]), categorical_cols))
-    preprocessor = ColumnTransformer(transformers=transformers, remainder="drop")
+def build_lr_classifier() -> Pipeline:
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ("num", Pipeline([
+                ("impute", SimpleImputer(strategy="constant", fill_value=0.0)),
+                ("scale", StandardScaler(with_mean=False)),
+            ]), numeric_feature_selector),
+            ("cat", Pipeline([
+                ("impute", SimpleImputer(strategy="most_frequent")),
+                ("onehot", OneHotEncoder(handle_unknown="ignore")),
+            ]), categorical_feature_selector),
+        ],
+        remainder="drop",
+    )
     model = LogisticRegression(
         max_iter=1400,
         class_weight="balanced",
@@ -987,41 +1011,10 @@ def holdout_weight_from_accuracy(acc: float, floor: float = 0.15, ceiling: float
         return 0.50
     return float(np.clip(acc, floor, ceiling))
 
-def accuracy_to_weight(acc: float, minimum: float = 0.18, maximum: float = 0.58) -> float:
+def accuracy_to_weight(acc: float) -> float:
     if acc is None or (isinstance(acc, float) and np.isnan(acc)):
-        return 0.35
-    return float(np.clip(0.10 + 0.75 * acc, minimum, maximum))
-
-
-def sharpen_probabilities(probs: np.ndarray, temperature: float = 0.92) -> np.ndarray:
-    probs = np.asarray(probs, dtype=float)
-    probs = np.clip(probs, 1e-9, None)
-    adjusted = probs ** (1.0 / max(temperature, 1e-6))
-    return adjusted / adjusted.sum()
-
-
-def dynamic_blend_probabilities(model_probs: np.ndarray, market_probs: np.ndarray, base_model_weight: float, task: str) -> np.ndarray:
-    model_probs = np.asarray(model_probs, dtype=float)
-    market_probs = np.asarray(market_probs, dtype=float)
-    model_probs = model_probs / model_probs.sum() if model_probs.sum() > 0 else np.repeat(1.0 / len(model_probs), len(model_probs))
-    market_probs = market_probs / market_probs.sum() if market_probs.sum() > 0 else np.repeat(1.0 / len(market_probs), len(market_probs))
-
-    model_probs = sharpen_probabilities(model_probs, 1.04 if task == "result" else 1.08)
-    market_probs = sharpen_probabilities(market_probs, 0.86 if task == "result" else 0.82)
-
-    model_conf = float(model_probs.max())
-    market_conf = float(market_probs.max())
-    confidence_gap = market_conf - model_conf
-
-    if task == "result":
-        weight = base_model_weight - 0.35 * max(confidence_gap, 0.0)
-        weight = float(np.clip(weight, 0.18, 0.52))
-    else:
-        weight = base_model_weight - 0.40 * max(confidence_gap, 0.0)
-        weight = float(np.clip(weight, 0.16, 0.48))
-
-    out = weight * model_probs + (1.0 - weight) * market_probs
-    return out / out.sum()
+        return 0.46
+    return float(np.clip(0.22 + 0.48 * acc, 0.28, 0.64))
 
 
 def train_models(features_df: pd.DataFrame, master_df: pd.DataFrame) -> Tuple[Optional[dict], List[str]]:
@@ -1048,8 +1041,8 @@ def train_models(features_df: pd.DataFrame, master_df: pd.DataFrame) -> Tuple[Op
     if y_result.nunique() < 3:
         warnings.append("Result model still needs all three classes (1, X, 2) represented.")
         return None, warnings
-    if y_total.nunique() < 4:
-        warnings.append("Total-goals model needs more class variety before training.")
+    if y_total.nunique() < 3:
+        warnings.append("Total-goals model still needs all three classes (0-1, 2-3, 4+) represented.")
         return None, warnings
 
     ordered = merged_train.sort_values("global_order").reset_index(drop=True)
@@ -1085,10 +1078,10 @@ def train_models(features_df: pd.DataFrame, master_df: pd.DataFrame) -> Tuple[Op
     X_test_total = X_test.loc[valid_total_test]
     yt_test = yt_test.loc[valid_total_test]
 
-    result_rf_eval = build_rf_classifier(X_train_result)
-    result_lr_eval = build_lr_classifier(X_train_result)
-    total_rf_eval = build_rf_classifier(X_train_total)
-    total_lr_eval = build_lr_classifier(X_train_total)
+    result_rf_eval = build_rf_classifier()
+    result_lr_eval = build_lr_classifier()
+    total_rf_eval = build_rf_classifier()
+    total_lr_eval = build_lr_classifier()
 
     result_rf_eval.fit(X_train_result, yr_train)
     result_lr_eval.fit(X_train_result, yr_train)
@@ -1100,10 +1093,10 @@ def train_models(features_df: pd.DataFrame, master_df: pd.DataFrame) -> Tuple[Op
     total_rf_acc = accuracy_score(yt_test, total_rf_eval.predict(X_test_total)) if len(X_test_total) else np.nan
     total_lr_acc = accuracy_score(yt_test, total_lr_eval.predict(X_test_total)) if len(X_test_total) else np.nan
 
-    result_rf_model = build_rf_classifier(X)
-    result_lr_model = build_lr_classifier(X)
-    total_rf_model = build_rf_classifier(X)
-    total_lr_model = build_lr_classifier(X)
+    result_rf_model = build_rf_classifier()
+    result_lr_model = build_lr_classifier()
+    total_rf_model = build_rf_classifier()
+    total_lr_model = build_lr_classifier()
     result_rf_model.fit(X, y_result)
     result_lr_model.fit(X, y_result)
     total_rf_model.fit(X, y_total)
@@ -1129,8 +1122,8 @@ def train_models(features_df: pd.DataFrame, master_df: pd.DataFrame) -> Tuple[Op
         "metrics": {
             "result_accuracy": None if np.isnan(max(result_rf_acc, result_lr_acc)) else float(max(result_rf_acc, result_lr_acc)),
             "total_accuracy": None if np.isnan(max(total_rf_acc, total_lr_acc)) else float(max(total_rf_acc, total_lr_acc)),
-            "result_model_weight": accuracy_to_weight(max(result_rf_acc, result_lr_acc), minimum=0.20, maximum=0.55),
-            "total_model_weight": accuracy_to_weight(max(total_rf_acc, total_lr_acc), minimum=0.16, maximum=0.45),
+            "result_model_weight": accuracy_to_weight(max(result_rf_acc, result_lr_acc)),
+            "total_model_weight": accuracy_to_weight(max(total_rf_acc, total_lr_acc)),
             "training_rows": int(len(X)),
             "trained_at": now_iso(),
         },
@@ -1232,6 +1225,43 @@ def blend_probabilities(model_probs: np.ndarray, market_probs: Optional[np.ndarr
     return out / denom if denom > 0 else np.repeat(1.0 / len(out), len(out))
 
 
+def probability_entropy(probs: np.ndarray) -> float:
+    p = np.clip(np.array(probs, dtype=float), 1e-12, 1.0)
+    return float(-(p * np.log(p)).sum())
+
+
+def dynamic_model_weight(base_weight: float, model_probs: np.ndarray, market_probs: Optional[np.ndarray], minimum: float = 0.18, maximum: float = 0.82) -> float:
+    weight = float(base_weight)
+    model_conf = float(np.max(model_probs)) if len(model_probs) else 0.0
+    weight += 0.22 * max(model_conf - (1.0 / max(len(model_probs), 1)), 0.0)
+    if market_probs is not None and len(market_probs) == len(model_probs):
+        market_conf = float(np.max(market_probs))
+        if market_conf > model_conf:
+            weight -= 0.35 * (market_conf - model_conf)
+        elif model_conf > market_conf:
+            weight += 0.15 * (model_conf - market_conf)
+        if int(np.argmax(model_probs)) == int(np.argmax(market_probs)):
+            weight += 0.06
+        market_entropy = probability_entropy(market_probs)
+        model_entropy = probability_entropy(model_probs)
+        if market_entropy < model_entropy:
+            weight -= 0.08
+    return float(np.clip(weight, minimum, maximum))
+
+
+def aggregate_total_market_probs(rec: pd.Series) -> np.ndarray:
+    exact = normalized_inverse_odds([
+        rec["odd_total_0"], rec["odd_total_1"], rec["odd_total_2"], rec["odd_total_3"],
+        rec["odd_total_4"], rec["odd_total_5"], rec["odd_total_6"],
+    ])
+    grouped = np.array([
+        exact[0] + exact[1],
+        exact[2] + exact[3],
+        exact[4] + exact[5] + exact[6],
+    ], dtype=float)
+    return grouped / grouped.sum() if grouped.sum() > 0 else np.repeat(1/3, 3)
+
+
 def generate_predictions(pred_input_df: pd.DataFrame, master_df: pd.DataFrame, standings_df: pd.DataFrame, bundle: dict) -> List[dict]:
     predictions = []
     next_cycle, next_week = next_cycle_week(master_df)
@@ -1259,13 +1289,19 @@ def generate_predictions(pred_input_df: pd.DataFrame, master_df: pd.DataFrame, s
             total_model_probs += weight * model_probs_to_order(model.classes_, probs, TOTAL_CLASS_ORDER)
 
         market_result_probs = normalized_inverse_odds([rec["odd_1"], rec["odd_X"], rec["odd_2"]])
-        market_total_probs = normalized_inverse_odds([
+        exact_market_total_probs = normalized_inverse_odds([
             rec["odd_total_0"], rec["odd_total_1"], rec["odd_total_2"], rec["odd_total_3"],
             rec["odd_total_4"], rec["odd_total_5"], rec["odd_total_6"],
         ])
+        market_total_probs = np.array([
+            exact_market_total_probs[0] + exact_market_total_probs[1],
+            exact_market_total_probs[2] + exact_market_total_probs[3],
+            exact_market_total_probs[4] + exact_market_total_probs[5] + exact_market_total_probs[6],
+        ], dtype=float)
+        market_total_probs = market_total_probs / market_total_probs.sum() if market_total_probs.sum() > 0 else np.repeat(1.0 / len(market_total_probs), len(market_total_probs))
 
-        result_probs = dynamic_blend_probabilities(result_model_probs, market_result_probs, bundle["metrics"].get("result_model_weight", 0.35), task="result")
-        total_probs = dynamic_blend_probabilities(total_model_probs, market_total_probs, bundle["metrics"].get("total_model_weight", 0.28), task="total")
+        result_probs = blend_probabilities(result_model_probs, market_result_probs, bundle["metrics"].get("result_model_weight", 0.68))
+        total_probs = blend_probabilities(total_model_probs, market_total_probs, bundle["metrics"].get("total_model_weight", 0.68))
 
         predictions.append(
             {
@@ -1324,7 +1360,7 @@ def render_prediction_cards(predictions: List[dict]) -> None:
                     for label in RESULT_CLASS_ORDER
                 )
                 total_html = "".join(
-                    f'<div class="prob-chip"><div class="prob-label">{label}</div><div class="prob-value">{fmt_pct(total_probs[label])}</div></div>'
+                    f'<div class="prob-chip"><div class="prob-label">{TOTAL_CLASS_LABELS[label]}</div><div class="prob-value">{fmt_pct(total_probs[label])}</div></div>'
                     for label in TOTAL_CLASS_ORDER
                 )
                 st.markdown(
@@ -1336,7 +1372,7 @@ def render_prediction_cards(predictions: List[dict]) -> None:
                         <div class="subhead">Total goals probabilities</div>
                         <div class="prob-grid total">{total_html}</div>
                         <div class="pick-line"><strong>Most likely result:</strong> {pred['best_result']}</div>
-                        <div class="pick-line"><strong>Most likely total goals:</strong> {pred['best_total']}</div>
+                        <div class="pick-line"><strong>Most likely total-goals class:</strong> {TOTAL_CLASS_LABELS[pred['best_total']]}</div>
                     </div>
                     ''',
                     unsafe_allow_html=True,
@@ -1347,7 +1383,7 @@ def render_prediction_cards(predictions: List[dict]) -> None:
 # UI
 # =========================
 st.title("⚽ Soccer Total Goals Prediction System")
-st.caption("Train from continuous results updates, retrain after each week update, and make optional on-demand multiclass predictions.")
+st.caption("Train from continuous results updates, retrain after each week update, and make optional on-demand predictions for result and 3-class total-goals buckets.")
 
 # Controls area
 left, right = st.columns([1.15, 1.0], gap="large")
@@ -1390,7 +1426,7 @@ with right:
         run_prediction = st.button("Predict now", use_container_width=True)
     with p2:
         retrain_only = st.button("Retrain from saved data", use_container_width=True)
-    st.markdown('<div class="caption-small">Prediction uses the latest trained models and a stronger market-aware blending step so fixtures are separated more clearly when odds are pasted.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="caption-small">Prediction uses the latest trained models. If odds are pasted, they are blended with the model probabilities to produce practical percentages.</div>', unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
 if refresh_system:
