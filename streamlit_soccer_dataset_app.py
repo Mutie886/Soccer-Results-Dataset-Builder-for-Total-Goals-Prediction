@@ -13,9 +13,10 @@ import streamlit as st
 from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 st.set_page_config(page_title="Soccer Total Goals Predictor", layout="wide")
 
@@ -255,11 +256,13 @@ def load_model_bundle() -> Optional[dict]:
 
 
 def save_model_bundle(bundle: dict) -> None:
-    # Save only pickle-safe objects. The trained sklearn pipelines, metrics, and feature names
+    # Save only pickle-safe objects. The trained sklearn pipelines and plain metadata
     # are serializable once all helper callables are top-level functions.
     safe_bundle = {
-        "result_model": bundle.get("result_model"),
-        "total_model": bundle.get("total_model"),
+        "result_rf_model": bundle.get("result_rf_model"),
+        "result_lr_model": bundle.get("result_lr_model"),
+        "total_rf_model": bundle.get("total_rf_model"),
+        "total_lr_model": bundle.get("total_lr_model"),
         "feature_columns": list(bundle.get("feature_columns", [])),
         "metrics": dict(bundle.get("metrics", {})),
     }
@@ -874,8 +877,8 @@ def numeric_feature_selector(df: pd.DataFrame) -> List[str]:
 def categorical_feature_selector(df: pd.DataFrame) -> List[str]:
     return [c for c in df.columns if not pd.api.types.is_numeric_dtype(df[c])]
 
-def build_classifier() -> Pipeline:
-    # Use top-level selectors so the trained pipeline can be serialized safely.
+
+def build_rf_classifier() -> Pipeline:
     preprocessor = ColumnTransformer(
         transformers=[
             ("num", SimpleImputer(strategy="constant", fill_value=0.0), numeric_feature_selector),
@@ -887,8 +890,8 @@ def build_classifier() -> Pipeline:
         remainder="drop",
     )
     model = RandomForestClassifier(
-        n_estimators=260,
-        max_depth=12,
+        n_estimators=320,
+        max_depth=14,
         min_samples_leaf=2,
         random_state=42,
         n_jobs=-1,
@@ -897,10 +900,46 @@ def build_classifier() -> Pipeline:
     return Pipeline([("prep", preprocessor), ("model", model)])
 
 
+def build_lr_classifier() -> Pipeline:
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ("num", Pipeline([
+                ("impute", SimpleImputer(strategy="constant", fill_value=0.0)),
+                ("scale", StandardScaler(with_mean=False)),
+            ]), numeric_feature_selector),
+            ("cat", Pipeline([
+                ("impute", SimpleImputer(strategy="most_frequent")),
+                ("onehot", OneHotEncoder(handle_unknown="ignore")),
+            ]), categorical_feature_selector),
+        ],
+        remainder="drop",
+    )
+    model = LogisticRegression(
+        max_iter=1400,
+        multi_class="multinomial",
+        class_weight="balanced",
+        solver="lbfgs",
+        n_jobs=None,
+    )
+    return Pipeline([("prep", preprocessor), ("model", model)])
+
+
+def weighted_average_probabilities(probs_a: np.ndarray, probs_b: np.ndarray, weight_a: float, weight_b: float) -> np.ndarray:
+    total = max(weight_a + weight_b, 1e-9)
+    out = (weight_a * probs_a + weight_b * probs_b) / total
+    denom = out.sum()
+    return out / denom if denom > 0 else np.repeat(1.0 / len(out), len(out))
+
+
+def holdout_weight_from_accuracy(acc: float, floor: float = 0.15, ceiling: float = 0.85) -> float:
+    if acc is None or (isinstance(acc, float) and np.isnan(acc)):
+        return 0.50
+    return float(np.clip(acc, floor, ceiling))
+
 def accuracy_to_weight(acc: float) -> float:
-    if np.isnan(acc):
-        return 1.0
-    return float(np.clip(0.55 + 0.30 * acc, 0.55, 0.82))
+    if acc is None or (isinstance(acc, float) and np.isnan(acc)):
+        return 0.50
+    return float(np.clip(0.32 + 0.55 * acc, 0.35, 0.72))
 
 
 def train_models(features_df: pd.DataFrame, master_df: pd.DataFrame) -> Tuple[Optional[dict], List[str]]:
@@ -933,29 +972,50 @@ def train_models(features_df: pd.DataFrame, master_df: pd.DataFrame) -> Tuple[Op
     yt_train = y_total.iloc[train_idx]
     yt_test = y_total.iloc[test_idx]
 
-    result_model_eval = build_classifier()
-    total_model_eval = build_classifier()
-    result_model_eval.fit(X_train, yr_train)
-    total_model_eval.fit(X_train, yt_train)
+    result_rf_eval = build_rf_classifier()
+    result_lr_eval = build_lr_classifier()
+    total_rf_eval = build_rf_classifier()
+    total_lr_eval = build_lr_classifier()
 
-    result_acc = accuracy_score(yr_test, result_model_eval.predict(X_test)) if len(X_test) else np.nan
-    total_acc = accuracy_score(yt_test, total_model_eval.predict(X_test)) if len(X_test) else np.nan
+    result_rf_eval.fit(X_train, yr_train)
+    result_lr_eval.fit(X_train, yr_train)
+    total_rf_eval.fit(X_train, yt_train)
+    total_lr_eval.fit(X_train, yt_train)
 
-    # Final fit on full data.
-    result_model = build_classifier()
-    total_model = build_classifier()
-    result_model.fit(X, y_result)
-    total_model.fit(X, y_total)
+    result_rf_acc = accuracy_score(yr_test, result_rf_eval.predict(X_test)) if len(X_test) else np.nan
+    result_lr_acc = accuracy_score(yr_test, result_lr_eval.predict(X_test)) if len(X_test) else np.nan
+    total_rf_acc = accuracy_score(yt_test, total_rf_eval.predict(X_test)) if len(X_test) else np.nan
+    total_lr_acc = accuracy_score(yt_test, total_lr_eval.predict(X_test)) if len(X_test) else np.nan
+
+    # Final fit on full data
+    result_rf_model = build_rf_classifier()
+    result_lr_model = build_lr_classifier()
+    total_rf_model = build_rf_classifier()
+    total_lr_model = build_lr_classifier()
+    result_rf_model.fit(X, y_result)
+    result_lr_model.fit(X, y_result)
+    total_rf_model.fit(X, y_total)
+    total_lr_model.fit(X, y_total)
 
     bundle = {
-        "result_model": result_model,
-        "total_model": total_model,
+        "result_rf_model": result_rf_model,
+        "result_lr_model": result_lr_model,
+        "total_rf_model": total_rf_model,
+        "total_lr_model": total_lr_model,
         "feature_columns": list(X.columns),
         "metrics": {
-            "result_accuracy": None if np.isnan(result_acc) else float(result_acc),
-            "total_accuracy": None if np.isnan(total_acc) else float(total_acc),
-            "result_model_weight": accuracy_to_weight(result_acc),
-            "total_model_weight": accuracy_to_weight(total_acc),
+            "result_rf_accuracy": None if np.isnan(result_rf_acc) else float(result_rf_acc),
+            "result_lr_accuracy": None if np.isnan(result_lr_acc) else float(result_lr_acc),
+            "total_rf_accuracy": None if np.isnan(total_rf_acc) else float(total_rf_acc),
+            "total_lr_accuracy": None if np.isnan(total_lr_acc) else float(total_lr_acc),
+            "result_accuracy": None if np.isnan(np.nanmean([result_rf_acc, result_lr_acc])) else float(np.nanmean([result_rf_acc, result_lr_acc])),
+            "total_accuracy": None if np.isnan(np.nanmean([total_rf_acc, total_lr_acc])) else float(np.nanmean([total_rf_acc, total_lr_acc])),
+            "result_rf_weight": holdout_weight_from_accuracy(result_rf_acc),
+            "result_lr_weight": holdout_weight_from_accuracy(result_lr_acc),
+            "total_rf_weight": holdout_weight_from_accuracy(total_rf_acc),
+            "total_lr_weight": holdout_weight_from_accuracy(total_lr_acc),
+            "result_model_weight": accuracy_to_weight(float(np.nanmean([result_rf_acc, result_lr_acc]))),
+            "total_model_weight": accuracy_to_weight(float(np.nanmean([total_rf_acc, total_lr_acc]))),
             "training_rows": int(len(X)),
             "trained_at": now_iso(),
         },
@@ -1066,12 +1126,26 @@ def generate_predictions(pred_input_df: pd.DataFrame, master_df: pd.DataFrame, s
         row = build_prediction_feature_row(master_df, standings_df, home_team, away_team, next_cycle, next_week)
         aligned = align_prediction_row(row, bundle["feature_columns"])
 
-        result_model = bundle["result_model"]
-        total_model = bundle["total_model"]
-        result_raw = result_model.predict_proba(aligned)[0]
-        total_raw = total_model.predict_proba(aligned)[0]
-        result_model_probs = model_probs_to_order(result_model.classes_, result_raw, RESULT_CLASS_ORDER)
-        total_model_probs = model_probs_to_order(total_model.classes_, total_raw, TOTAL_CLASS_ORDER)
+        result_rf = bundle["result_rf_model"]
+        result_lr = bundle["result_lr_model"]
+        total_rf = bundle["total_rf_model"]
+        total_lr = bundle["total_lr_model"]
+
+        result_rf_probs = model_probs_to_order(result_rf.classes_, result_rf.predict_proba(aligned)[0], RESULT_CLASS_ORDER)
+        result_lr_probs = model_probs_to_order(result_lr.classes_, result_lr.predict_proba(aligned)[0], RESULT_CLASS_ORDER)
+        total_rf_probs = model_probs_to_order(total_rf.classes_, total_rf.predict_proba(aligned)[0], TOTAL_CLASS_ORDER)
+        total_lr_probs = model_probs_to_order(total_lr.classes_, total_lr.predict_proba(aligned)[0], TOTAL_CLASS_ORDER)
+
+        result_model_probs = weighted_average_probabilities(
+            result_rf_probs, result_lr_probs,
+            bundle["metrics"].get("result_rf_weight", 0.5),
+            bundle["metrics"].get("result_lr_weight", 0.5),
+        )
+        total_model_probs = weighted_average_probabilities(
+            total_rf_probs, total_lr_probs,
+            bundle["metrics"].get("total_rf_weight", 0.5),
+            bundle["metrics"].get("total_lr_weight", 0.5),
+        )
 
         market_result_probs = normalized_inverse_odds([rec["odd_1"], rec["odd_X"], rec["odd_2"]])
         market_total_probs = normalized_inverse_odds([
@@ -1079,8 +1153,9 @@ def generate_predictions(pred_input_df: pd.DataFrame, master_df: pd.DataFrame, s
             rec["odd_total_4"], rec["odd_total_5"], rec["odd_total_6"],
         ])
 
-        result_probs = blend_probabilities(result_model_probs, market_result_probs, bundle["metrics"]["result_model_weight"])
-        total_probs = blend_probabilities(total_model_probs, market_total_probs, bundle["metrics"]["total_model_weight"])
+        # Use market more strongly when the trained model is still modest on holdout data.
+        result_probs = blend_probabilities(result_model_probs, market_result_probs, bundle["metrics"].get("result_model_weight", 0.5))
+        total_probs = blend_probabilities(total_model_probs, market_total_probs, bundle["metrics"].get("total_model_weight", 0.5))
 
         predictions.append(
             {
