@@ -255,7 +255,15 @@ def load_model_bundle() -> Optional[dict]:
 
 
 def save_model_bundle(bundle: dict) -> None:
-    joblib.dump(bundle, MODEL_BUNDLE_PATH)
+    # Save only pickle-safe objects. The trained sklearn pipelines, metrics, and feature names
+    # are serializable once all helper callables are top-level functions.
+    safe_bundle = {
+        "result_model": bundle.get("result_model"),
+        "total_model": bundle.get("total_model"),
+        "feature_columns": list(bundle.get("feature_columns", [])),
+        "metrics": dict(bundle.get("metrics", {})),
+    }
+    joblib.dump(safe_bundle, MODEL_BUNDLE_PATH)
 
 
 # =========================
@@ -856,17 +864,25 @@ def prepare_training_matrix(features_df: pd.DataFrame, master_df: pd.DataFrame) 
     return X, y_result, y_total
 
 
+
+
+# Pickle-safe column selectors for sklearn ColumnTransformer
+def numeric_feature_selector(df: pd.DataFrame) -> List[str]:
+    return [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+
+
+def categorical_feature_selector(df: pd.DataFrame) -> List[str]:
+    return [c for c in df.columns if not pd.api.types.is_numeric_dtype(df[c])]
+
 def build_classifier() -> Pipeline:
-    numeric_selector = lambda df: [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
-    categorical_selector = lambda df: [c for c in df.columns if not pd.api.types.is_numeric_dtype(df[c])]
-    # ColumnTransformer accepts callables on DataFrame input.
+    # Use top-level selectors so the trained pipeline can be serialized safely.
     preprocessor = ColumnTransformer(
         transformers=[
-            ("num", SimpleImputer(strategy="constant", fill_value=0.0), numeric_selector),
+            ("num", SimpleImputer(strategy="constant", fill_value=0.0), numeric_feature_selector),
             ("cat", Pipeline([
                 ("impute", SimpleImputer(strategy="most_frequent")),
                 ("onehot", OneHotEncoder(handle_unknown="ignore")),
-            ]), categorical_selector),
+            ]), categorical_feature_selector),
         ],
         remainder="drop",
     )
@@ -971,7 +987,7 @@ def parse_prediction_input(raw_text: str) -> Tuple[pd.DataFrame, List[str]]:
             continue
         home_team = normalize_team_name(block[0])
         away_team = normalize_team_name(block[1])
-        labels = block[2::2]
+        labels = [str(x).strip().upper() if str(x).strip().upper() == "X" else str(x).strip() for x in block[2::2]]
         odds_vals = block[3::2]
 
         if labels != expected_labels:
