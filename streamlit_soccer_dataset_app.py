@@ -20,7 +20,7 @@ MASTER_PATH = DATA_DIR / "matches_master.csv"
 STATE_PATH = DATA_DIR / "system_state.json"
 
 
-MASTER_COLUMNS = [
+BASE_MASTER_COLUMNS = [
     "match_id",
     "cycle_id",
     "week_number",
@@ -41,33 +41,60 @@ MASTER_COLUMNS = [
     "created_at",
 ]
 
+ANALYSIS_COLUMNS = [
+    "home_team_avg_count",
+    "home_team_max_count",
+    "home_team_repeat_category",
+    "away_team_avg_count",
+    "away_team_max_count",
+    "away_team_repeat_category",
+]
+
+MASTER_COLUMNS = BASE_MASTER_COLUMNS + ANALYSIS_COLUMNS
+
 
 st.markdown(
     """
     <style>
-    .stApp {background: linear-gradient(180deg,#0f172a 0%,#111827 100%); color: #e5e7eb;}
+    .stApp {
+        background: linear-gradient(180deg,#0f172a 0%,#111827 100%);
+        color: #e5e7eb;
+    }
+
     .main-card {
         background: rgba(17,24,39,0.88);
         border: 1px solid rgba(148,163,184,0.18);
         border-radius: 18px;
-        padding: 18px;
-        margin-bottom: 14px;
+        padding: 14px;
+        margin-bottom: 12px;
     }
+
     .section-title {
-        font-size: 1.08rem;
+        font-size: 1.02rem;
         font-weight: 700;
         color: #f8fafc;
-        margin-bottom: 0.45rem;
+        margin-bottom: 0.35rem;
     }
+
     .caption-small {
-        font-size: 0.84rem;
+        font-size: 0.80rem;
         color: #cbd5e1;
     }
+
     div[data-testid="stMetric"] {
         background: rgba(17,24,39,0.88);
         border: 1px solid rgba(148,163,184,0.18);
-        padding: 14px;
+        padding: 12px;
         border-radius: 16px;
+    }
+
+    textarea {
+        min-height: 115px !important;
+        max-height: 115px !important;
+    }
+
+    div[data-testid="stTextArea"] {
+        max-width: 360px;
     }
     </style>
     """,
@@ -191,6 +218,10 @@ def read_master() -> pd.DataFrame:
             "goal_diff",
             "home_team_counter",
             "away_team_counter",
+            "home_team_avg_count",
+            "home_team_max_count",
+            "away_team_avg_count",
+            "away_team_max_count",
         ]
 
         for col in numeric_cols:
@@ -413,7 +444,7 @@ def assign_cycle_ids(master: pd.DataFrame, new_df: pd.DataFrame) -> pd.DataFrame
 
 
 # ============================================================
-# EXACT TWO-COLUMN COUNTER LOGIC
+# COUNTER LOGIC
 # ============================================================
 
 def apply_pair_counters(master_df: pd.DataFrame) -> pd.DataFrame:
@@ -455,7 +486,119 @@ def apply_pair_counters(master_df: pd.DataFrame) -> pd.DataFrame:
         df.at[idx, "home_team_counter"] = team_counter[home_team]
         df.at[idx, "away_team_counter"] = team_counter[away_team]
 
-    return df[MASTER_COLUMNS].copy()
+    return df.copy()
+
+
+# ============================================================
+# TEAM COUNTER ANALYSIS
+# ============================================================
+
+def build_team_counter_analysis(master_df: pd.DataFrame) -> pd.DataFrame:
+    if master_df.empty:
+        return pd.DataFrame(
+            columns=[
+                "team",
+                "matches_played",
+                "average_count",
+                "maximum_count",
+                "most_repeated_count",
+                "most_repeated_count_frequency",
+                "repeat_category",
+            ]
+        )
+
+    home_part = master_df[["home_team", "home_team_counter"]].rename(
+        columns={
+            "home_team": "team",
+            "home_team_counter": "counter",
+        }
+    )
+
+    away_part = master_df[["away_team", "away_team_counter"]].rename(
+        columns={
+            "away_team": "team",
+            "away_team_counter": "counter",
+        }
+    )
+
+    long_df = pd.concat([home_part, away_part], ignore_index=True)
+    long_df["counter"] = pd.to_numeric(long_df["counter"], errors="coerce")
+    long_df = long_df.dropna(subset=["team", "counter"])
+
+    records = []
+
+    for team, group in long_df.groupby("team"):
+        counts = group["counter"].astype(int)
+        freq = counts.value_counts()
+
+        most_repeated_count = int(freq.index[0]) if not freq.empty else 0
+        most_repeated_frequency = int(freq.iloc[0]) if not freq.empty else 0
+
+        matches_played = int(len(counts))
+        average_count = round(float(counts.mean()), 2)
+        maximum_count = int(counts.max())
+
+        repeat_ratio = most_repeated_frequency / matches_played if matches_played else 0
+
+        if repeat_ratio >= 0.40:
+            repeat_category = "Repeating Counts"
+        elif repeat_ratio >= 0.25:
+            repeat_category = "Moderate Repeating Counts"
+        else:
+            repeat_category = "Rare Repeating Counts"
+
+        records.append(
+            {
+                "team": team,
+                "matches_played": matches_played,
+                "average_count": average_count,
+                "maximum_count": maximum_count,
+                "most_repeated_count": most_repeated_count,
+                "most_repeated_count_frequency": most_repeated_frequency,
+                "repeat_category": repeat_category,
+            }
+        )
+
+    analysis_df = pd.DataFrame(records)
+    analysis_df = analysis_df.sort_values(
+        ["repeat_category", "average_count", "maximum_count"],
+        ascending=[True, False, False],
+    ).reset_index(drop=True)
+
+    return analysis_df
+
+
+def add_analysis_to_master(master_df: pd.DataFrame) -> pd.DataFrame:
+    if master_df.empty:
+        return master_df.copy()
+
+    df = master_df.copy()
+
+    analysis_df = build_team_counter_analysis(df)
+
+    lookup = analysis_df.set_index("team").to_dict("index")
+
+    df["home_team_avg_count"] = df["home_team"].map(
+        lambda x: lookup.get(x, {}).get("average_count", np.nan)
+    )
+    df["home_team_max_count"] = df["home_team"].map(
+        lambda x: lookup.get(x, {}).get("maximum_count", np.nan)
+    )
+    df["home_team_repeat_category"] = df["home_team"].map(
+        lambda x: lookup.get(x, {}).get("repeat_category", "")
+    )
+
+    df["away_team_avg_count"] = df["away_team"].map(
+        lambda x: lookup.get(x, {}).get("average_count", np.nan)
+    )
+    df["away_team_max_count"] = df["away_team"].map(
+        lambda x: lookup.get(x, {}).get("maximum_count", np.nan)
+    )
+    df["away_team_repeat_category"] = df["away_team"].map(
+        lambda x: lookup.get(x, {}).get("repeat_category", "")
+    )
+
+    return df
 
 
 # ============================================================
@@ -516,6 +659,7 @@ def append_to_master(new_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, 
     master = master.sort_values("global_order").reset_index(drop=True)
 
     master = apply_pair_counters(master)
+    master = add_analysis_to_master(master)
 
     save_master(master)
 
@@ -571,7 +715,7 @@ st.caption(
     "Otherwise, each team increments according to its own previous count."
 )
 
-left, right = st.columns([4, 1], gap="large")
+left, middle, right = st.columns([1.2, 2.8, 1.1], gap="large")
 
 with left:
     st.markdown(
@@ -579,8 +723,7 @@ with left:
         <div class="main-card">
             <div class="section-title">Recent matches input</div>
             <div class="caption-small">
-                Paste recent results. Format should be 4 lines per match:
-                home team, home goals, away goals, away team.
+                Paste results here.
             </div>
         </div>
         """,
@@ -589,10 +732,41 @@ with left:
 
     raw_text = st.text_area(
         "Recent results input",
-        height=320,
+        height=115,
         placeholder="Paste results here...",
         label_visibility="collapsed",
     )
+
+with middle:
+    st.markdown(
+        """
+        <div class="main-card">
+            <div class="section-title">Team Counter Analysis</div>
+            <div class="caption-small">
+                Average count, maximum count, and repeating-count category for each team.
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    current_master_for_analysis = read_master()
+
+    if not current_master_for_analysis.empty:
+        current_master_for_analysis = apply_pair_counters(current_master_for_analysis)
+        current_master_for_analysis = add_analysis_to_master(current_master_for_analysis)
+        save_master(current_master_for_analysis)
+
+        analysis_df = build_team_counter_analysis(current_master_for_analysis)
+
+        st.dataframe(
+            analysis_df,
+            use_container_width=True,
+            hide_index=True,
+            height=180,
+        )
+    else:
+        st.info("No team analysis yet. Process results first.")
 
 with right:
     st.markdown(
@@ -719,6 +893,7 @@ master_df = read_master()
 
 if not master_df.empty:
     master_df = apply_pair_counters(master_df)
+    master_df = add_analysis_to_master(master_df)
     save_master(master_df)
 
 st.markdown(
