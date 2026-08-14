@@ -9,16 +9,13 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-
 st.set_page_config(page_title="Soccer TG Counter System", layout="wide")
-
 
 DATA_DIR = Path("data_store")
 DATA_DIR.mkdir(exist_ok=True)
 
 MASTER_PATH = DATA_DIR / "matches_master.csv"
 STATE_PATH = DATA_DIR / "system_state.json"
-
 
 BASE_MASTER_COLUMNS = [
     "match_id",
@@ -51,7 +48,6 @@ ANALYSIS_COLUMNS = [
 ]
 
 MASTER_COLUMNS = BASE_MASTER_COLUMNS + ANALYSIS_COLUMNS
-
 
 st.markdown(
     """
@@ -100,7 +96,6 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
-
 
 # ============================================================
 # BASIC HELPERS
@@ -448,6 +443,11 @@ def assign_cycle_ids(master: pd.DataFrame, new_df: pd.DataFrame) -> pd.DataFrame
 # ============================================================
 
 def apply_pair_counters(master_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Increments count for each match played without a hit.
+    When a total goal hit (0, 5, or 6+) occurs, the hit match records
+    the reached count (e.g., Hit @ 6), and then resets the counter to 0 for the next match.
+    """
     if master_df.empty:
         return master_df.copy()
 
@@ -456,16 +456,9 @@ def apply_pair_counters(master_df: pd.DataFrame) -> pd.DataFrame:
     df["home_team_counter"] = 0
     df["away_team_counter"] = 0
 
-    current_cycle = None
     team_counter = {}
 
     for idx, row in df.iterrows():
-        row_cycle = int(row["cycle_id"])
-
-        if current_cycle is None or row_cycle != current_cycle:
-            current_cycle = row_cycle
-            team_counter = {}
-
         home_team = row["home_team"]
         away_team = row["away_team"]
         total_goals = int(row["total_goals"])
@@ -476,15 +469,18 @@ def apply_pair_counters(master_df: pd.DataFrame) -> pd.DataFrame:
         if away_team not in team_counter:
             team_counter[away_team] = 0
 
+        # Increment count for current fixture
+        team_counter[home_team] += 1
+        team_counter[away_team] += 1
+
+        # Assign counter to current match row
+        df.at[idx, "home_team_counter"] = team_counter[home_team]
+        df.at[idx, "away_team_counter"] = team_counter[away_team]
+
+        # Reset counter AFTER recording if hit condition was reached
         if is_hit(total_goals):
             team_counter[home_team] = 0
             team_counter[away_team] = 0
-        else:
-            team_counter[home_team] += 1
-            team_counter[away_team] += 1
-
-        df.at[idx, "home_team_counter"] = team_counter[home_team]
-        df.at[idx, "away_team_counter"] = team_counter[away_team]
 
     return df.copy()
 
@@ -492,6 +488,42 @@ def apply_pair_counters(master_df: pd.DataFrame) -> pd.DataFrame:
 # ============================================================
 # TEAM COUNTER ANALYSIS
 # ============================================================
+
+def get_current_team_streaks(master_df: pd.DataFrame) -> pd.DataFrame:
+    """Extracts the current active streak count for all teams up to the latest match."""
+    if master_df.empty:
+        return pd.DataFrame(columns=["team", "current_count", "last_cycle", "last_week"])
+
+    records = []
+    teams = pd.unique(pd.concat([master_df["home_team"], master_df["away_team"]]))
+
+    for team in teams:
+        team_matches = master_df[(master_df["home_team"] == team) | (master_df["away_team"] == team)]
+        if team_matches.empty:
+            continue
+        
+        latest_match = team_matches.sort_values("global_order").iloc[-1]
+        
+        # Determine counter on latest match
+        if latest_match["home_team"] == team:
+            count = int(latest_match["home_team_counter"])
+        else:
+            count = int(latest_match["away_team_counter"])
+
+        # Check if the latest match was a hit (meaning active count resets to 0)
+        if is_hit(int(latest_match["total_goals"])):
+            count = 0
+
+        records.append({
+            "team": team,
+            "current_count": count,
+            "last_cycle": int(latest_match["cycle_id"]),
+            "last_week": int(latest_match["week_number"])
+        })
+
+    streak_df = pd.DataFrame(records).sort_values("current_count", ascending=False).reset_index(drop=True)
+    return streak_df
+
 
 def build_team_counter_analysis(master_df: pd.DataFrame) -> pd.DataFrame:
     if master_df.empty:
@@ -709,10 +741,9 @@ def get_metrics() -> dict:
 st.title("⚽ Soccer TG Pair Counter System")
 
 st.caption(
-    "This system stores match records and uses only two counter columns: "
-    "home_team_counter and away_team_counter. "
-    "If total goals is 0, 5, or 6+, both teams reset to 0. "
-    "Otherwise, each team increments according to its own previous count."
+    "This system stores match records and updates running counts for every team week by week. "
+    "If total goals is 0, 5, or 6+, both teams reset their counter after the match. "
+    "Otherwise, each team increments its streak count."
 )
 
 left, middle, right = st.columns([1.2, 2.8, 1.1], gap="large")
@@ -886,7 +917,7 @@ if process_results:
 
 
 # ============================================================
-# DASHBOARD
+# DASHBOARD: TEAMS WITH > 10 COUNTS
 # ============================================================
 
 master_df = read_master()
@@ -899,10 +930,10 @@ if not master_df.empty:
 st.markdown(
     """
     <div class="main-card">
-        <div class="section-title">Last 10 match pairs dashboard</div>
+        <div class="section-title">🚨 High Drought Hot List (>10 Counts)</div>
         <div class="caption-small">
-            Only the latest 10 stored rows are shown here.
-            Every row is saved in matches_master.csv.
+            Displays only teams currently on active streaks over 10 games without a 0, 5, or 6+ total goal match.
+            These teams are prime candidates to hit the trigger condition next.
         </div>
     </div>
     """,
@@ -912,13 +943,24 @@ st.markdown(
 if master_df.empty:
     st.info("No records yet. Process results first.")
 else:
-    dashboard_df = master_df.sort_values("global_order").tail(10)
+    streaks_df = get_current_team_streaks(master_df)
+    hot_list_df = streaks_df[streaks_df["current_count"] > 10].reset_index(drop=True)
 
-    st.dataframe(
-        dashboard_df,
-        use_container_width=True,
-        hide_index=True,
-    )
+    if hot_list_df.empty:
+        st.success("No teams currently have a drought count greater than 10.")
+    else:
+        st.dataframe(
+            hot_list_df.rename(
+                columns={
+                    "team": "Team Name",
+                    "current_count": "Active Streak Count",
+                    "last_cycle": "Cycle ID",
+                    "last_week": "Latest Match Week",
+                }
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
 
 
 # ============================================================
